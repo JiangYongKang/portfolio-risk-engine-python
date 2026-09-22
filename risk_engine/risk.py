@@ -10,6 +10,7 @@ from risk_engine.errors import (
     ComputationError,
     InsufficientDataError,
     InvalidWindowError,
+    RiskEngineError,
 )
 from risk_engine.models import (
     CorrelationAssumption,
@@ -201,6 +202,9 @@ def parametric_tail(
             math.exp(-z * z / 2) / math.sqrt(2 * math.pi) / (1 - confidence)
         ) * sigma1 * scale
     except ComputationError:
+        raise
+    except RiskEngineError:
+        # typed correlation/window errors must propagate with their own code
         raise
     except Exception as exc:  # never leak raw numeric errors
         raise ComputationError(f"parametric risk computation failed: {exc}") from exc
