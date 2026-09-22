@@ -1,8 +1,3 @@
-from fastapi import FastAPI
+"""Compatibility entry point: ``fastapi dev main.py``."""
 
-app = FastAPI()
-
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+from app.main import app  # noqa: F401
