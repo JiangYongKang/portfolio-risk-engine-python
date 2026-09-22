@@ -19,7 +19,12 @@ from risk_engine.models import (
     MarketData,
     Portfolio,
 )
-from risk_engine.risk import build_report, z_for_confidence
+from risk_engine.risk import build_report, historical_tail, z_for_confidence
+from risk_engine.series import (
+    aligned_price_matrix,
+    simple_returns,
+    window_slice,
+)
 
 from .conftest import log
 
@@ -148,3 +153,14 @@ def test_invalid_confidence_has_distinct_code(market, portfolio):
     with pytest.raises(InvalidParameterError) as ei:
         build_report(portfolio, market, window=10, confidence=0.4)
     assert ei.value.code == "INVALID_PARAMETER"
+
+
+def test_window_one_historical_ok_but_parametric_needs_two(market, portfolio):
+    log.info("case=window-boundary window=1; criterion: historical accepted, parametric rejected")
+    dates, instruments, prices = aligned_price_matrix(portfolio, market)
+    rets = window_slice(simple_returns(prices), 1)
+    estimate = historical_tail(portfolio, instruments, prices[-2:], rets, 0.99, 1)
+    assert math.isfinite(estimate.var)
+    # the full report runs the parametric method too, which needs >=2 returns
+    with pytest.raises(InsufficientDataError):
+        build_report(portfolio, market, window=1)
