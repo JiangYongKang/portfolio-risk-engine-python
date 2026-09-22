@@ -46,6 +46,10 @@ class UnknownScenarioError(RiskEngineError):
     code = "UNKNOWN_SCENARIO"
 
 
+class UnknownAssumptionError(RiskEngineError):
+    code = "UNKNOWN_ASSUMPTION"
+
+
 class UnknownVersionError(RiskEngineError):
     code = "UNKNOWN_VERSION"
 

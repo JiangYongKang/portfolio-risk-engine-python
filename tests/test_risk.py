@@ -139,3 +139,12 @@ def test_z_quantile_matches_normal_table():
     assert z_for_confidence(0.99) == pytest.approx(2.3263478740, abs=1e-9)
     with pytest.raises(InvalidParameterError):
         z_for_confidence(0.5)
+
+
+def test_invalid_confidence_has_distinct_code(market, portfolio):
+    log.info("case=bad-confidence c=0.4; criterion: INVALID_PARAMETER")
+    from risk_engine.errors import InvalidParameterError
+
+    with pytest.raises(InvalidParameterError) as ei:
+        build_report(portfolio, market, window=10, confidence=0.4)
+    assert ei.value.code == "INVALID_PARAMETER"

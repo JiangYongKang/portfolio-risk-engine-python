@@ -6,8 +6,10 @@ from dataclasses import dataclass
 from datetime import date
 
 from risk_engine.batch import BatchLimits, run_batch
+from risk_engine.correlation import combine_block_diagonal
 from risk_engine.errors import (
     IncompatibleVersionError,
+    UnknownAssumptionError,
     UnknownScenarioError,
 )
 from risk_engine.models import (
@@ -75,9 +77,19 @@ class RiskService:
         try:
             return self._correlations[name]
         except KeyError:
-            raise UnknownScenarioError(
+            raise UnknownAssumptionError(
                 f"correlation assumption '{name}' is not registered"
             )
+
+    def compose_correlation(
+        self, result_name: str, names: list[str], *, version: str = "v1"
+    ) -> CorrelationAssumption:
+        assumptions = [self.get_correlation(n) for n in names]
+        composed = combine_block_diagonal(
+            result_name, assumptions, version=version
+        )
+        self.register_correlation(composed)
+        return composed
 
     def compose_named(
         self, result_name: str, names: list[str], *, version: str = "v1"

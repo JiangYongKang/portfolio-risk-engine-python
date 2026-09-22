@@ -15,10 +15,11 @@ from risk_engine.errors import (
 from risk_engine.api.mappers import to_correlation, to_job, to_market, to_portfolio
 from risk_engine.api.scenarios_schemas import (
     ComposeSchema,
+    CorrelationComposeSchema,
     ScenarioEvaluateRequest,
     ScenarioSchema,
 )
-from risk_engine.api.schemas import AssessRequest, BatchAssessRequest
+from risk_engine.api.schemas import AssessRequest, BatchAssessRequest, CorrelationSchema
 from risk_engine.models import FactorShock, StressScenario
 from risk_engine.service import report_to_dict, scenario_to_dict
 
@@ -45,6 +46,20 @@ def _http_status(err: RiskEngineError) -> int:
     if isinstance(err, ComputationError):
         return 500
     return 422
+
+
+def _resolve_correlation(svc, payload):
+    """Inline matrix wins over a registered name; both given is rejected."""
+    if payload.correlation is not None and payload.correlation_name:
+        raise RiskEngineError(
+            "provide either 'correlation' or 'correlation_name', not both",
+            code="INVALID_PARAMETER",
+        )
+    if payload.correlation is not None:
+        return to_correlation(payload.correlation)
+    if payload.correlation_name:
+        return svc.get_correlation(payload.correlation_name)
+    return None
 
 
 def _summary(payload) -> dict:
@@ -76,13 +91,14 @@ def assess(payload: AssessRequest, request: Request):
     logger.info("assess request summary=%s", _summary(payload))
     svc = _service(request)
     try:
+        correlation = _resolve_correlation(svc, payload)
         report = svc.assess(
             to_portfolio(payload.portfolio),
             to_market(payload.market),
             window=payload.window,
             confidence=payload.confidence,
             horizon_days=payload.horizon_days,
-            correlation=to_correlation(payload.correlation) if payload.correlation else None,
+            correlation=correlation,
             version=payload.version,
         )
     except RiskEngineError as err:
@@ -103,21 +119,40 @@ def batch(payload: BatchAssessRequest, request: Request):
         max_items=payload.max_items or BatchLimits().max_items,
         timeout_seconds=payload.timeout_seconds or BatchLimits().timeout_seconds,
     )
+    from risk_engine.models import BatchItemResult
+
+    # Resolve each request independently so one bad reference does not
+    # abort the batch; resolution failures occupy their own ordered slot.
+    jobs = []
+    pre_failures: dict[int, dict] = {}
+    for i, req in enumerate(payload.requests):
+        try:
+            jobs.append(to_job(req, _resolve_correlation(svc, req)))
+        except RiskEngineError as err:
+            jobs.append(None)
+            pre_failures[i] = err.to_dict()
     try:
-        results = svc.batch_assess([to_job(r) for r in payload.requests], limits)
+        results = svc.batch_assess([j for j in jobs if j is not None], limits)
     except RiskEngineError as err:
         return _error_response(err, _http_status(err))
+
+    # Re-insert pre-resolution failures at their original indices.
+    merged: list = []
+    k = 0
+    for i in range(len(payload.requests)):
+        if i in pre_failures:
+            merged.append(
+                {"index": i, "ok": False, "result": None, "error": pre_failures[i]}
+            )
+        else:
+            r = results[k]
+            k += 1
+            merged.append(
+                {"index": i, "ok": r.ok, "result": r.result, "error": r.error}
+            )
     return {
-        "count": len(results),
-        "results": [
-            {
-                "index": r.index,
-                "ok": r.ok,
-                "result": r.result,
-                "error": r.error,
-            }
-            for r in results
-        ],
+        "count": len(merged),
+        "results": merged,
     }
 
 
@@ -190,3 +225,44 @@ def evaluate(payload: ScenarioEvaluateRequest, request: Request):
 @router.get("/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+@router.post("/correlations")
+def register_correlation(payload: CorrelationSchema, request: Request):
+    svc = _service(request)
+    assumption = to_correlation(payload)
+    try:
+        # validate eagerly so an invalid matrix is rejected at registration
+        from risk_engine.correlation import validate_matrix
+
+        validate_matrix(
+            [list(r) for r in assumption.matrix], assumption.instruments
+        )
+        svc.register_correlation(assumption)
+    except RiskEngineError as err:
+        return _error_response(err, _http_status(err))
+    except ValueError:
+        return _error_response(
+            RiskEngineError(
+                f"correlation '{payload.name}' already registered",
+                code="ASSUMPTION_EXISTS",
+            ),
+            409,
+        )
+    return {"registered": assumption.name, "instruments": len(assumption.instruments)}
+
+
+@router.post("/correlations/compose")
+def compose_correlations(payload: "CorrelationComposeSchema", request: Request):
+    svc = _service(request)
+    try:
+        composed = svc.compose_correlation(
+            payload.result_name, payload.names, version=payload.version
+        )
+    except RiskEngineError as err:
+        return _error_response(err, _http_status(err))
+    return {
+        "registered": composed.name,
+        "instruments": list(composed.instruments),
+        "from": payload.names,
+    }

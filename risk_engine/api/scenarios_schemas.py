@@ -34,3 +34,9 @@ class ScenarioEvaluateRequest(BaseModel):
     scenario: ScenarioSchema | None = None
     scenario_name: str | None = None
     correlation: CorrelationSchema | None = None
+
+
+class CorrelationComposeSchema(BaseModel):
+    result_name: str
+    names: list[str] = Field(min_length=1)
+    version: str = "v1"

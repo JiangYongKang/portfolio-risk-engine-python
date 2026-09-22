@@ -8,7 +8,7 @@
 - 入口：`main.py`（FastAPI app）
 - 核心代码：`risk_engine/`（series / risk / correlation / scenarios /
   versions / batch / service）
-- 测试：`tests/`（60 例）
+- 测试：`tests/`（64 例）
 
 ```bash
 uv sync

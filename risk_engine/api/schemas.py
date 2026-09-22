@@ -34,6 +34,7 @@ class AssessRequest(BaseModel):
     confidence: float = Field(default=0.99, gt=0.5, lt=1.0)
     horizon_days: int = Field(default=1, ge=1)
     correlation: CorrelationSchema | None = None
+    correlation_name: str | None = None
     version: str = "v1"
 
 

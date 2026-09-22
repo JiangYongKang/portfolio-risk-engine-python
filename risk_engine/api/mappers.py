@@ -47,13 +47,17 @@ def to_correlation(schema: CorrelationSchema) -> CorrelationAssumption:
     )
 
 
-def to_job(schema: AssessRequest) -> AssessmentJob:
+def to_job(schema: AssessRequest, correlation=None) -> AssessmentJob:
     return AssessmentJob(
         portfolio=to_portfolio(schema.portfolio),
         market=to_market(schema.market),
         window=schema.window,
         confidence=schema.confidence,
         horizon_days=schema.horizon_days,
-        correlation=to_correlation(schema.correlation) if schema.correlation else None,
+        correlation=(
+            correlation
+            if correlation is not None
+            else (to_correlation(schema.correlation) if schema.correlation else None)
+        ),
         version=schema.version,
     )

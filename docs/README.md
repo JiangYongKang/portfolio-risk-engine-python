@@ -8,7 +8,7 @@
 
 ```bash
 uv sync                       # 安装依赖（含 pytest）
-uv run pytest tests/ -q       # 运行全部测试（60 例）
+uv run pytest tests/ -q       # 运行全部测试（64 例）
 uv run uvicorn main:app --reload   # 启动服务，默认 http://127.0.0.1:8000
 ```
 
@@ -99,6 +99,17 @@ curl -s -X POST http://127.0.0.1:8000/api/risk/scenarios/evaluate \
 3. `ASYMMETRIC_MATRIX` — 非对称（容差 1e-9）；
 4. `NOT_POSITIVE_DEFINITE` — Cholesky 分解失败（非正定）。
 
+### 可命名、可组合的相关性假设
+
+- `POST /api/risk/correlations` 注册命名相关性矩阵（注册时立即严格校验，
+  非法矩阵当场拒绝）；
+- `POST /api/risk/correlations/compose` 将多个**不相交因子块**做块状对角
+  组合（跨块相关系数置 0）；若因子块存在重叠，因无法无歧义合并，按
+  `DIMENSION_MISMATCH` 明确拒绝，不做平均或静默修正；
+- 评估时可用内联 `correlation` 或已注册的 `correlation_name` 引用；两者
+  同时提供返回 `INVALID_PARAMETER`；引用不存在的名称返回
+  `UNKNOWN_ASSUMPTION`。批量中单个错误引用只影响其自身槽位。
+
 底层数值实现的异常（如分解中的算术错误）会被包装为
 `COMPUTATION_ERROR`，**不会**把原始异常透出给调用方。
 
@@ -128,9 +139,11 @@ curl -s -X POST http://127.0.0.1:8000/api/risk/scenarios/evaluate \
 | code | 含义 | HTTP |
 |---|---|---|
 | `INSUFFICIENT_DATA` | 历史不足/窗口超过样本/非正价格/序列不齐 | 422 |
-| `INVALID_WINDOW` | window<1、horizon<1、置信度越界 | 422 |
+| `INVALID_WINDOW` | window<1、horizon<1 | 422 |
+| `INVALID_PARAMETER` | 置信度越界、冲突入参 | 422 |
 | `UNKNOWN_INSTRUMENT` | 标的无行情或未持有 | 422 |
-| `UNKNOWN_SCENARIO` | 情景/相关性名称未注册 | 422 |
+| `UNKNOWN_SCENARIO` | 情景名称未注册 | 422 |
+| `UNKNOWN_ASSUMPTION` | 相关性假设名称未注册 | 422 |
 | `UNKNOWN_VERSION` | 版本未注册 | 422 |
 | `DIMENSION_MISMATCH` | 矩阵维度/标的集合不匹配 | 422 |
 | `INVALID_CORRELATION_VALUE` | 相关值越界/非有限/对角非1 | 422 |

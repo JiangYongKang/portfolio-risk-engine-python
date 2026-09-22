@@ -150,3 +150,51 @@ def build_covariance(
             vb = vol_by_inst[instruments[b]]
             cov[a][b] = corr[pos[a]][pos[b]] * va * vb
     return cov
+
+
+def combine_block_diagonal(
+    name: str,
+    assumptions: list[CorrelationAssumption],
+    *,
+    version: str = "v1",
+) -> CorrelationAssumption:
+    """Combine assumptions over **disjoint** factor blocks.
+
+    Blocks with overlapping instruments cannot be combined unambiguously
+    and are rejected with ``DIMENSION_MISMATCH`` rather than averaged.
+    Cross-block correlations are set to zero (block-diagonal construction),
+    ordered by first appearance of instruments, which is deterministic.
+    Each input assumption is validated first.
+    """
+    seen: set[InstrumentId] = set()
+    ordered: list[InstrumentId] = []
+    blocks: list[Matrix] = []
+    for assump in assumptions:
+        m = validate_matrix(assump.matrix, assump.instruments)
+        overlap = set(assump.instruments) & seen
+        if overlap:
+            raise DimensionMismatchError(
+                "cannot combine overlapping correlation blocks on "
+                f"{sorted(overlap)}"
+            )
+        seen.update(assump.instruments)
+        ordered.extend(assump.instruments)
+        blocks.append(m)
+
+    n = len(ordered)
+    combined: Matrix = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        combined[i][i] = 1.0
+    offset = 0
+    for m in blocks:
+        k = len(m)
+        for a in range(k):
+            for b in range(k):
+                combined[offset + a][offset + b] = m[a][b]
+        offset += k
+    return CorrelationAssumption(
+        name=name,
+        instruments=tuple(ordered),
+        matrix=tuple(tuple(row) for row in combined),
+        version=version,
+    )

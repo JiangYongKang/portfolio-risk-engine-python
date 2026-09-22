@@ -87,3 +87,26 @@ def test_scenario_versions_are_stamped(portfolio, market):
     result = svc.run_scenario(portfolio, market, sc)
     log.info("case=scenario-stamp version=%s", result.version)
     assert result.version == "v2"
+
+
+def test_named_correlation_register_reference_and_compose(portfolio, market):
+    from risk_engine.models import CorrelationAssumption
+    from risk_engine.errors import UnknownAssumptionError
+
+    from risk_engine.models import Holding, Portfolio
+
+    svc = RiskService()
+    two_asset = Portfolio("ab-fund", (Holding("A", 10.0), Holding("B", -5.0)))
+    ab = CorrelationAssumption("ab", ("A", "B"), ((1.0, 0.5), (0.5, 1.0)))
+    cc = CorrelationAssumption("cc", ("C",), ((1.0,),))
+    svc.register_correlation(ab)
+    svc.register_correlation(cc)
+    log.info("case=named-corr register+reference; criterion: same as inline")
+    named = svc.assess(two_asset, market, window=20, correlation=svc.get_correlation("ab"))
+    inline = svc.assess(two_asset, market, window=20, correlation=ab)
+    assert named.parametric.var == inline.parametric.var
+    with pytest.raises(UnknownAssumptionError):
+        svc.get_correlation("nope")
+    composed = svc.compose_correlation("abc", ["ab", "cc"])
+    log.info("case=named-corr-compose instruments=%s", list(composed.instruments))
+    assert composed.instruments == ("A", "B", "C")

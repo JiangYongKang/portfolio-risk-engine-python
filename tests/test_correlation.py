@@ -134,3 +134,28 @@ def test_cholesky_factor_reconstructs_matrix():
     for i in range(2):
         for j in range(2):
             assert reconstructed[i][j] == pytest.approx(matrix[i][j])
+
+
+def test_block_diagonal_combine_zero_cross_block():
+    a = CorrelationAssumption("a", ("A", "B"), ((1.0, 0.3), (0.3, 1.0)))
+    c = CorrelationAssumption("c", ("C",), ((1.0,),))
+    combined = corr.combine_block_diagonal("ac", [a, c])
+    log.info("case=block-diagonal instruments=%s", list(combined.instruments))
+    assert combined.instruments == ("A", "B", "C")
+    m = combined.matrix
+    # within-block preserved
+    assert m[0][1] == m[1][0] == 0.3
+    # cross-block zeroed, identity diagonal
+    assert m[0][2] == m[1][2] == m[2][0] == m[2][1] == 0.0
+    # combined must remain valid PD
+    corr.validate_matrix(
+        [list(r) for r in m], combined.instruments
+    )
+
+
+def test_block_diagonal_overlap_rejected():
+    a = CorrelationAssumption("a", ("A", "B"), ((1.0, 0.3), (0.3, 1.0)))
+    b = CorrelationAssumption("b", ("B", "C"), ((1.0, 0.2), (0.2, 1.0)))
+    log.info("case=block-overlap blocks on {A,B} and {B,C}")
+    with pytest.raises(DimensionMismatchError):
+        corr.combine_block_diagonal("bad", [a, b])
