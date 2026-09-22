@@ -34,6 +34,10 @@ class InvalidWindowError(RiskEngineError):
     code = "INVALID_WINDOW"
 
 
+class InvalidParameterError(RiskEngineError):
+    code = "INVALID_PARAMETER"
+
+
 class UnknownInstrumentError(RiskEngineError):
     code = "UNKNOWN_INSTRUMENT"
 

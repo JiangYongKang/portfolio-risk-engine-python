@@ -9,6 +9,7 @@ from risk_engine.correlation import build_covariance
 from risk_engine.errors import (
     ComputationError,
     InsufficientDataError,
+    InvalidParameterError,
     InvalidWindowError,
     RiskEngineError,
 )
@@ -54,7 +55,7 @@ def _erf_inv(x: float) -> float:
 def z_for_confidence(confidence: float) -> float:
     """One-sided standard normal quantile (loss) for given confidence."""
     if not (0.5 < confidence < 1.0):
-        raise InvalidWindowError(
+        raise InvalidParameterError(
             f"confidence must be within (0.5, 1.0), got {confidence}"
         )
     return math.sqrt(2.0) * _erf_inv(2 * confidence - 1)
@@ -232,6 +233,10 @@ def build_report(
 ) -> RiskReport:
     if window < 1:
         raise InvalidWindowError(f"window must be >= 1, got {window}")
+    if not (0.5 < confidence < 1.0):
+        raise InvalidParameterError(
+            f"confidence must be within (0.5, 1.0), got {confidence}"
+        )
     dates, instruments, prices = aligned_price_matrix(portfolio, market)
     all_returns = simple_returns(prices)
     returns = window_slice(all_returns, window)

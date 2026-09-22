@@ -9,6 +9,7 @@ import pytest
 
 from risk_engine.errors import (
     InsufficientDataError,
+    InvalidParameterError,
     InvalidWindowError,
     UnknownInstrumentError,
 )
@@ -136,5 +137,5 @@ def test_confidence_quantiles_are_monotonic(market, portfolio):
 def test_z_quantile_matches_normal_table():
     log.info("case=z-table z99; criterion: |error| < 1e-9")
     assert z_for_confidence(0.99) == pytest.approx(2.3263478740, abs=1e-9)
-    with pytest.raises(InvalidWindowError):
+    with pytest.raises(InvalidParameterError):
         z_for_confidence(0.5)
