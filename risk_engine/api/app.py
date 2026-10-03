@@ -8,6 +8,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from risk_engine.api.routes import router
+from risk_engine.api.scan_routes import router as scan_router
 from risk_engine.errors import RiskEngineError
 from risk_engine.service import RiskService
 
@@ -15,9 +16,10 @@ logger = logging.getLogger("risk_engine")
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Portfolio Risk Engine", version="1.0")
+    app = FastAPI(title="Portfolio Risk Engine", version="1.1")
     app.state.risk_service = RiskService()
     app.include_router(router)
+    app.include_router(scan_router)
 
     @app.get("/")
     def read_root() -> dict:

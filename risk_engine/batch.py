@@ -22,6 +22,7 @@ from time import perf_counter
 from risk_engine.errors import (
     BatchSizeLimitError,
     ComputationError,
+    InvalidParameterError,
     RiskEngineError,
 )
 from risk_engine.models import BatchItemResult
@@ -57,7 +58,7 @@ def run_batch(
     if n == 0:
         return []
     if limits.max_workers < 1 or limits.timeout_seconds <= 0:
-        raise BatchSizeLimitError("invalid batch limits configuration")
+        raise InvalidParameterError("invalid batch limits configuration")
 
     results: list[BatchItemResult | None] = [None] * n
 
@@ -74,6 +75,19 @@ def run_batch(
     ) as pool:
         futures = [pool.submit(_work, i, req) for i, req in enumerate(requests)]
         for i, fut in enumerate(futures):
+            # First honour an item whose computation has already finished,
+            # even if the global deadline elapsed while earlier slots were
+            # being collected: completed work must never be discarded nor
+            # mislabelled as a timeout.
+            if fut.done():
+                idx, payload, error = fut.result()
+                results[idx] = BatchItemResult(
+                    index=idx,
+                    ok=error is None,
+                    result=payload,
+                    error=error,
+                )
+                continue
             remaining = deadline - perf_counter()
             if remaining <= 0:
                 results[i] = BatchItemResult(
@@ -82,7 +96,7 @@ def run_batch(
                     error={
                         "code": "EVALUATION_TIMEOUT",
                         "reason": f"batch time budget {limits.timeout_seconds}s "
-                        "exceeded",
+                        "exceeded before the item completed",
                     },
                 )
                 continue
@@ -94,7 +108,8 @@ def run_batch(
                     ok=False,
                     error={
                         "code": "EVALUATION_TIMEOUT",
-                        "reason": f"item exceeded time budget",
+                        "reason": "item did not complete within the batch "
+                        "time budget",
                     },
                 )
                 continue
@@ -105,7 +120,14 @@ def run_batch(
                 error=error,
             )
 
-    return [r if r is not None else BatchItemResult(i, False, None, {
-        "code": "EVALUATION_TIMEOUT",
-        "reason": "no result produced",
-    }) for i, r in enumerate(results)]
+    return [
+        r
+        if r is not None
+        else BatchItemResult(
+            i,
+            False,
+            None,
+            {"code": "EVALUATION_TIMEOUT", "reason": "no result produced"},
+        )
+        for i, r in enumerate(results)
+    ]

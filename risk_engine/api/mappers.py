@@ -18,6 +18,8 @@ from risk_engine.models import (
     Portfolio,
     StressScenario,
 )
+from risk_engine.recompare import HistoricalConclusion
+from risk_engine.scan import ScanCell
 from risk_engine.service import AssessmentJob
 
 
@@ -60,4 +62,26 @@ def to_job(schema: AssessRequest, correlation=None) -> AssessmentJob:
             else (to_correlation(schema.correlation) if schema.correlation else None)
         ),
         version=schema.version,
+    )
+
+
+def to_scan_cell(schema) -> "ScanCell":
+    return ScanCell(
+        portfolio=to_portfolio(schema.portfolio),
+        market=to_market(schema.market),
+        scenario_name=schema.scenario_name,
+        correlation_name=schema.correlation_name,
+        version=schema.version,
+    )
+
+
+def to_historical_conclusion(schema) -> "HistoricalConclusion":
+    return HistoricalConclusion(
+        portfolio=to_portfolio(schema.portfolio),
+        market=to_market(schema.market),
+        stamped_version=schema.stamped_version,
+        conclusion=schema.conclusion,
+        window=schema.window,
+        confidence=schema.confidence,
+        horizon_days=schema.horizon_days,
     )

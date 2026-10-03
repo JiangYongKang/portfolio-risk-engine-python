@@ -50,3 +50,49 @@ def long_market() -> MarketData:
 
 def summary(**kw) -> None:
     log.info("INPUT SUMMARY %s | decision: %s", kw.get("case"), kw)
+
+
+def _fixture_summary(name: str, value) -> str:
+    """Compact, single-line description of a shared fixture value."""
+    if name in ("market", "long_market"):
+        prices = getattr(value, "prices", {})
+        return (
+            f"MarketData(dates={len(getattr(value, 'dates', ()))}, "
+            f"instruments={sorted(prices)})"
+        )
+    if name == "portfolio":
+        holdings = [
+            f"{h.instrument}x{h.quantity}" for h in getattr(value, "holdings", ())
+        ]
+        return f"Portfolio({getattr(value, 'name', '?')}, {holdings})"
+    return str(value)
+
+
+@pytest.fixture(autouse=True)
+def _log_case_verdict(request):
+    """Log every test's inputs up front and its pass/fail verdict afterwards.
+
+    Active by default (see pytest.ini ``log_cli=true``) so the plain
+    ``uv run pytest`` command already shows what each case fed in and the
+    criterion its result was judged against.
+    """
+    fixtured = {
+        name: _fixture_summary(name, request.getfixturevalue(name))
+        for name in ("market", "long_market", "portfolio")
+        if name in getattr(request.function, "fixturenames", set())
+    }
+    log.info(
+        "CASE START %s | fixtures: %s",
+        request.node.nodeid,
+        fixtured if fixtured else "(no shared fixtures / inline inputs)",
+    )
+    yield
+    log.info("CASE VERDICT %s | PASSED", request.node.nodeid)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    report = outcome.get_result()
+    if report.when == "call" and report.failed:
+        log.info("CASE VERDICT %s | FAILED: %s", item.nodeid, call.excinfo.value)

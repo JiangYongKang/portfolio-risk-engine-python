@@ -136,3 +136,29 @@ def test_concurrent_execution_actually_overlaps():
     log.info("case=overlap elapsed=%.3f serial=0.8", elapsed)
     assert all(r.ok for r in out)
     assert elapsed < 0.5
+
+
+def test_completed_items_preserved_when_deadline_expires():
+    # A tight global budget: fast items must keep their exact computed
+    # payload (never dropped, never mislabelled timeout); only items still
+    # running at the deadline get EVALUATION_TIMEOUT.
+    def mixed(x):
+        time.sleep(0.35 if x % 2 else 0.005)
+        return {"x": x}
+
+    out = run_batch(
+        list(range(8)), mixed,
+        BatchLimits(max_items=32, max_workers=8, timeout_seconds=0.1),
+    )
+    fast = [r for r in out if r.index % 2 == 0]
+    slow = [r for r in out if r.index % 2 == 1]
+    log.info(
+        "case=deadline-preserves fast_ok=%s slow_timeout=%s",
+        [r.ok for r in fast],
+        [r.error["code"] if not r.ok else None for r in slow],
+    )
+    assert all(r.ok and r.result == {"x": r.index} for r in fast)
+    assert all(
+        not r.ok and r.error["code"] == "EVALUATION_TIMEOUT" for r in slow
+    )
+    assert [r.index for r in out] == list(range(8))
