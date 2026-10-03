@@ -9,6 +9,7 @@ from risk_engine.batch import BatchLimits, run_batch
 from risk_engine.correlation import combine_block_diagonal
 from risk_engine.errors import (
     IncompatibleVersionError,
+    RiskEngineError,
     UnknownAssumptionError,
     UnknownScenarioError,
 )
@@ -21,11 +22,20 @@ from risk_engine.models import (
     ScenarioResult,
     StressScenario,
 )
+from risk_engine.reassess import (
+    VERDICT_CHANGED,
+    VERDICT_REJECTED,
+    VERDICT_REPRODUCED,
+    ReassessJob,
+    conclusions_equal,
+)
 from risk_engine.risk import build_report
 from risk_engine.scenarios import (
     compose_scenarios,
     evaluate_scenario,
 )
+from risk_engine.scan import ScanJob, expand_pairs
+from risk_engine.snapshot import SnapshotEntry, build_snapshot, rank_worst
 from risk_engine.versions import RulesVersion, VersionRegistry, default_registry
 
 
@@ -156,6 +166,56 @@ class RiskService:
             version=target_version,
         )
 
+    # --- cross-version reassessment ---------------------------------------
+
+    def reassess_one(self, job: ReassessJob) -> dict:
+        """Recompute one stamped conclusion under a target version.
+
+        Never raises for expected refusals: version/input problems become
+        a ``REJECTED`` verdict carrying the typed error.
+        """
+        try:
+            report = self.reassess_under_version(
+                job.portfolio,
+                job.market,
+                stamped_version=job.stamped_version,
+                target_version=job.target_version,
+                window=job.window,
+                confidence=job.confidence,
+                horizon_days=job.horizon_days,
+                correlation=job.correlation,
+                allow_breaking=job.allow_breaking,
+            )
+        except RiskEngineError as err:
+            return {
+                "verdict": VERDICT_REJECTED,
+                "portfolio": job.portfolio.name,
+                "stamped_version": job.stamped_version,
+                "target_version": job.target_version,
+                "error": err.to_dict(),
+                "recomputed": None,
+            }
+        recomputed = report_to_dict(report)
+        verdict = (
+            VERDICT_REPRODUCED
+            if conclusions_equal(job.original, recomputed)
+            else VERDICT_CHANGED
+        )
+        return {
+            "verdict": verdict,
+            "portfolio": job.portfolio.name,
+            "stamped_version": job.stamped_version,
+            "target_version": job.target_version,
+            "error": None,
+            "recomputed": recomputed,
+        }
+
+    def batch_reassess(
+        self, jobs: list[ReassessJob], limits: BatchLimits | None = None
+    ) -> list[BatchItemResult]:
+        """Batch cross-version reassessment: ordered, isolated verdicts."""
+        return run_batch(jobs, self.reassess_one, limits)
+
     # --- scenarios --------------------------------------------------------
 
     def run_scenario(
@@ -173,6 +233,76 @@ class RiskService:
         self, jobs: list[AssessmentJob], limits: BatchLimits | None = None
     ) -> list[BatchItemResult]:
         return run_batch(jobs, self._run_job, limits)
+
+    def scan(
+        self, jobs: list[ScanJob], limits: BatchLimits | None = None
+    ) -> list[BatchItemResult]:
+        """Scan portfolios x registered scenarios as one ordered batch.
+
+        Results are flattened in submission order (portfolio-major).  An
+        unknown scenario name or a failing pair occupies only its own
+        slot; every other pair is unaffected.
+        """
+        pairs = expand_pairs(jobs)
+        return run_batch(pairs, self._run_scan_pair, limits)
+
+    def scan_snapshot(
+        self, jobs: list[ScanJob], limits: BatchLimits | None = None
+    ) -> dict:
+        """Run a scan and freeze the results into a ranked snapshot.
+
+        The returned document is deterministic: serialize it with
+        ``risk_engine.snapshot.canonical_json`` for byte-stable export.
+        """
+        pairs = expand_pairs(jobs)
+        results = run_batch(pairs, self._run_scan_pair, limits)
+        entries: list[SnapshotEntry] = []
+        for (portfolio, market, scenario_name), item in zip(pairs, results):
+            summary = {
+                "portfolio": portfolio.name,
+                "scenario": scenario_name,
+                "holdings": len(portfolio.holdings),
+                "dates": len(market.dates),
+            }
+            if item.ok:
+                version = item.result["version"]
+                rationale = (
+                    f"scenario '{scenario_name}' evaluated under rules "
+                    f"{version} on portfolio '{portfolio.name}': "
+                    f"pnl={item.result['pnl']!r}; "
+                    f"consistent_with_single_factor="
+                    f"{item.result['consistent_with_single_factor']}"
+                )
+            else:
+                version = ""
+                rationale = (
+                    f"rejected: {item.error['code']} — {item.error['reason']}"
+                )
+            entries.append(
+                SnapshotEntry(
+                    index=item.index,
+                    kind="scenario",
+                    input_summary=summary,
+                    version=version,
+                    ok=item.ok,
+                    rationale=rationale,
+                    result=item.result,
+                    error=item.error,
+                )
+            )
+        rankings = {
+            "worst_by_portfolio": rank_worst(entries, group_by="portfolio"),
+            "worst_by_scenario": rank_worst(entries, group_by="scenario"),
+        }
+        return build_snapshot(entries, rankings=rankings)
+
+    def _run_scan_pair(self, pair: tuple) -> dict:
+        portfolio, market, scenario_name = pair
+        scenario = self.get_scenario(scenario_name)  # unknown -> per-slot error
+        result = evaluate_scenario(portfolio, market, scenario)
+        payload = scenario_to_dict(result)
+        payload["portfolio"] = portfolio.name
+        return payload
 
     def _run_job(self, job: AssessmentJob) -> dict:
         report = self.assess(

@@ -168,3 +168,102 @@ def test_missing_scenario_reference_http():
     log.info("case=http-missing-scenario code=%s", r.json()["error"]["code"])
     assert r.status_code == 422
     assert r.json()["error"]["code"] == "UNKNOWN_SCENARIO"
+
+
+def test_scan_endpoint_order_isolation_and_limit():
+    # register two scenarios (unique names to avoid clashing across tests)
+    for name, shock in [("scan_drop", -0.1), ("scan_rally", 0.05)]:
+        client.post(
+            "/api/risk/scenarios",
+            json={"name": name,
+                  "shocks": [{"instrument": "A", "relative_move": shock}]},
+        )
+    job = {
+        "portfolio": {"name": "fund-s",
+                      "holdings": [{"instrument": "A", "quantity": 10}]},
+        "market": {"dates": _dates(3),
+                   "prices": {"A": [100.0, 101.0, 102.0]}},
+        "scenario_names": ["scan_drop", "scan_missing", "scan_rally"],
+    }
+    r = client.post("/api/risk/scan", json={"jobs": [job, job]})
+    d = r.json()
+    log.info("case=http-scan status=%s count=%s", r.status_code, d.get("count"))
+    assert r.status_code == 200
+    assert d["count"] == 6
+    oks = [item["ok"] for item in d["results"]]
+    assert oks == [True, False, True, True, False, True]
+    assert d["results"][1]["error"]["code"] == "UNKNOWN_SCENARIO"
+    assert d["results"][0]["result"]["scenario"] == "scan_drop"
+    assert d["results"][5]["result"]["scenario"] == "scan_rally"
+    # repeated submission is deterministic
+    r2 = client.post("/api/risk/scan", json={"jobs": [job, job]})
+    assert r2.json() == d
+    # expanded pair count is what the item limit sees
+    r3 = client.post("/api/risk/scan",
+                     json={"jobs": [job, job], "max_items": 5})
+    assert r3.status_code == 429
+    assert r3.json()["error"]["code"] == "BATCH_SIZE_LIMIT"
+
+
+def test_reassess_endpoint_verdicts():
+    from risk_engine.versions import RulesVersion
+
+    svc = app.state.risk_service
+    for v, parents in [("v2", {"v1"}), ("v3", set())]:
+        try:
+            svc.register_version(
+                RulesVersion(v, "2026-06-01", "v1", frozenset(parents))
+            )
+        except ValueError:
+            pass  # already registered by an earlier run of this test
+
+    body = _valid_body()
+    original = client.post("/api/risk/assess", json=body).json()
+
+    def job(target, allow=False):
+        return {
+            "portfolio": body["portfolio"],
+            "market": body["market"],
+            "stamped_version": "v1",
+            "target_version": target,
+            "original": original,
+            "window": body["window"],
+            "allow_breaking": allow,
+        }
+
+    r = client.post("/api/risk/reassess",
+                    json={"jobs": [job("v2"), job("v3"), job("v3", allow=True)]})
+    d = r.json()
+    verdicts = [item["result"]["verdict"] for item in d["results"]]
+    log.info("case=http-reassess verdicts=%s", verdicts)
+    assert r.status_code == 200
+    assert verdicts == ["REPRODUCED", "REJECTED", "REPRODUCED"]
+    assert d["results"][1]["result"]["error"]["code"] == "INCOMPATIBLE_VERSION"
+    assert d["results"][2]["result"]["recomputed"]["version"] == "v3"
+
+
+def test_scan_snapshot_endpoint_deterministic():
+    for name, shock in [("snap_drop", -0.1), ("snap_rally", 0.05)]:
+        client.post(
+            "/api/risk/scenarios",
+            json={"name": name,
+                  "shocks": [{"instrument": "A", "relative_move": shock}]},
+        )
+    job = {
+        "portfolio": {"name": "fund-p",
+                      "holdings": [{"instrument": "A", "quantity": 4}]},
+        "market": {"dates": _dates(3), "prices": {"A": [10.0, 11.0, 12.0]}},
+        "scenario_names": ["snap_drop", "snap_rally"],
+    }
+    body = {"jobs": [job]}
+    r1 = client.post("/api/risk/scan/snapshot", json=body)
+    r2 = client.post("/api/risk/scan/snapshot", json=body)
+    log.info("case=http-snapshot status=%s", r1.status_code)
+    assert r1.status_code == 200
+    d = r1.json()
+    assert d["format"] == "risk-engine-snapshot/1"
+    assert d["count"] == 2
+    assert r1.content == r2.content  # byte-identical over the wire
+    assert d["rankings"]["worst_by_portfolio"]["items"][0]["name"] == "fund-p"
+    assert d["rankings"]["worst_by_scenario"]["items"][0]["name"] == "snap_drop"
+    assert "rationale" in d["entries"][0]

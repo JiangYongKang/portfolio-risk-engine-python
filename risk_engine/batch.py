@@ -74,6 +74,15 @@ def run_batch(
     ) as pool:
         futures = [pool.submit(_work, i, req) for i, req in enumerate(requests)]
         for i, fut in enumerate(futures):
+            # A future that already completed keeps its result even if the
+            # batch deadline has passed: only genuinely unfinished items
+            # are marked EVALUATION_TIMEOUT.
+            if fut.done():
+                idx, payload, error = fut.result()
+                results[idx] = BatchItemResult(
+                    index=idx, ok=error is None, result=payload, error=error
+                )
+                continue
             remaining = deadline - perf_counter()
             if remaining <= 0:
                 results[i] = BatchItemResult(

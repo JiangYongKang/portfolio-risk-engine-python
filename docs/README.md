@@ -132,7 +132,74 @@ curl -s -X POST http://127.0.0.1:8000/api/risk/scenarios/evaluate \
   失败只影响其自身槽位，其余结论不受影响。
 - 资源/时间上限：
   - 批量大小超限 → 整体拒绝 `BATCH_SIZE_LIMIT`（HTTP 429）；
-  - 单项/整体超出时间预算 → 该槽位标记 `EVALUATION_TIMEOUT`。
+  - 单项/整体超出时间预算 → 该槽位标记 `EVALUATION_TIMEOUT`；
+  - 时限到点时**已完成的条目原样保留**，只有真正未完成的条目才
+    被判为超时。
+
+## 批量扫描（多组合 × 多已登记情景）
+
+- `POST /api/risk/scan` 或 `RiskService.scan`：一次提交多个组合，每个
+  组合对一组**已注册情景名**逐一求值。
+- 展开顺序为「组合优先」：job 0 的全部情景、job 1 的全部情景……
+  返回顺序与提交顺序严格一致，与并行度无关，且与逐个单跑的结果
+  完全一致。
+- 单条失败（如情景名未注册 `UNKNOWN_SCENARIO`、标的未持有
+  `UNKNOWN_INSTRUMENT`）只占用自己的槽位，其余条目照常出结果。
+- 条目数上限按**展开后的 (组合 × 情景) 对数**计：超限整批拒绝
+  `BATCH_SIZE_LIMIT`；总时限到点未完成的对标记 `EVALUATION_TIMEOUT`，
+  已完成的对保留。
+- 四类失败可区分：超时 `EVALUATION_TIMEOUT`、超容量
+  `BATCH_SIZE_LIMIT`、输入非法（如 `UNKNOWN_SCENARIO` 等 422 族）、
+  内部错误 `COMPUTATION_ERROR`。
+
+## 跨版本批量重算对比
+
+- `POST /api/risk/reassess` 或 `RiskService.batch_reassess`：把一批按
+  旧版本打戳的结论，在目标版本下整批重算并逐条判定：
+  - `REPRODUCED` — 重算结论与原结论**逐位一致**（`version` 戳本身
+    不参与比较），旧结论在新规则下仍成立；
+  - `CHANGED` — 允许重算但结论已不同，口径实际发生了变化；
+  - `REJECTED` — 不允许重算（版本未声明兼容且未显式授权、版本未
+    注册、输入非法等），条目携带具体错误码。
+- 单条的拒绝/失败不影响其他条目，也不打乱返回顺序。
+- **破坏性升级绝不静默生效**：未声明兼容的版本对默认判 `REJECTED`
+  （`INCOMPATIBLE_VERSION`）；只有调用方在该条目上显式传
+  `allow_breaking=true` 才会重算，且结论以**新版本重新打戳**。
+
+## 结果快照与最差情形排名
+
+- `POST /api/risk/scan/snapshot` 或 `RiskService.scan_snapshot`：跑一次
+  扫描并把结果冻结成一份自包含快照（`format:
+  risk-engine-snapshot/1`）。
+- **确定性**：相同输入重复跑任意多次、任意并行度，快照序列化结果
+  逐位一致。需要字节级稳定导出时用
+  `risk_engine.snapshot.canonical_json(snapshot)`（键排序、浮点按
+  最短可还原表示、拒绝 NaN/Infinity）。
+- 每条目携带：输入概况（组合/情景/持仓数/行情天数）、规则版本戳、
+  判定理由（`rationale`，说明结论如何得出或为何被拒）。
+- 排名（`rankings`）：
+  - `worst_by_portfolio` — 每个组合在其所有情景下的最差（最小）
+    PnL，按该值升序排（亏得最多的在前）；
+  - `worst_by_scenario` — 每个情景在所有组合下的最差 PnL，同理；
+  - 口径在载荷中明示：`metric: pnl`、`order: ascending`；并列时按
+    **名称字典序、再按首次提交下标**（`tie_break` 字段说明），因此
+    同一批输入每次排名完全相同。失败条目不参与排名。
+
+## 批量上限与时限配置
+
+`BatchLimits`（库）与请求体字段（HTTP）一一对应：
+
+| 配置 | 默认 | 含义 |
+|---|---|---|
+| `max_items` | 128 | 条目数上限（扫描按展开后的对数计），超限整批拒绝 |
+| `timeout_seconds` | 5.0 | 整批总时间预算，到点未完成条目标 `EVALUATION_TIMEOUT` |
+| `max_workers` | 8 | 并行度（仅库内可调；不影响结果与顺序） |
+
+HTTP 请求体示例（`/scan`、`/reassess`、`/batch` 同构）：
+
+```json
+{"jobs": [...], "max_items": 256, "timeout_seconds": 10.0}
+```
 
 ## 错误码一览
 
@@ -158,17 +225,30 @@ curl -s -X POST http://127.0.0.1:8000/api/risk/scenarios/evaluate \
 ## 本地验证方法
 
 ```bash
-# 全量测试（含非法相关性、极端情景、并发批量）
+# 全量测试（含非法相关性、极端情景、并发批量、扫描、跨版本对比、快照）
+# 默认即打印每个用例的输入摘要与判定依据，无需额外参数
 uv run pytest tests/ -q
-
-# 查看每个用例的输入摘要与判定依据（日志）
-uv run pytest tests/ -q -s -o log_cli=true --log-cli-level=INFO
 
 # 单模块
 uv run pytest tests/test_correlation.py -q
 uv run pytest tests/test_batch.py -q
+uv run pytest tests/test_scan.py -q
+uv run pytest tests/test_reassess.py -q
+uv run pytest tests/test_snapshot.py -q
 ```
 
 测试日志约定：每个用例通过 `log.info("case=...; criterion: ...")`
-打印**输入摘要**与**判定依据**，失败时可直接定位是输入构造问题还是
+打印**输入摘要**与**判定依据**（pytest.ini 已默认开启
+`log_cli=true`，INFO 级），失败时可直接定位是输入构造问题还是
 结论偏离预期。
+
+## 与既有能力的兼容范围
+
+- 新增的 `/scan`、`/scan/snapshot`、`/reassess` 端点与
+  `RiskService.scan / scan_snapshot / batch_reassess` 均为**纯增量**，
+  不改变 `/assess`、`/batch`、情景与相关性端点的既有行为。
+- 快照格式独立版本化（`risk-engine-snapshot/1`），与规则版本
+  （`v1`/`v2`/...）正交：规则版本戳在每条目内，快照格式版本在
+  文档头部。
+- 跨版本重算沿用既有 `compatible_parents` 声明机制；未声明兼容的
+  版本对默认拒绝，授权后重算并以新版本打戳，旧结论不被改写。

@@ -115,6 +115,28 @@ def test_raw_exception_is_wrapped_not_leaked():
     assert "kaboom" in out[0].error["reason"]
 
 
+def test_completed_items_kept_when_deadline_passes():
+    # item0 is slow and blows the budget; item1 finished long before the
+    # deadline is noticed.  The finished item must keep its result.
+    def work(x):
+        time.sleep(0.3 if x == 0 else 0.01)
+        return {"v": x}
+
+    out = run_batch(
+        [0, 1], work,
+        BatchLimits(max_items=4, max_workers=2, timeout_seconds=0.15),
+    )
+    log.info(
+        "case=deadline-keeps-done out=%s; criterion: done item kept, "
+        "unfinished item timed out",
+        [(r.ok, None if r.ok else r.error["code"]) for r in out],
+    )
+    assert out[0].ok is False
+    assert out[0].error["code"] == "EVALUATION_TIMEOUT"
+    assert out[1].ok is True
+    assert out[1].result == {"v": 1}
+
+
 def test_empty_batch_returns_empty():
     out = run_batch([], lambda x: {}, BatchLimits())
     assert out == []
