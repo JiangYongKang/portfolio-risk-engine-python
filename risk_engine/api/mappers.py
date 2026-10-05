@@ -1,4 +1,9 @@
-"""Translate HTTP schemas into domain objects."""
+"""Translate HTTP schemas into domain objects.
+
+Malformed payloads raise :class:`InvalidInputError` (never raw
+``ValueError``/``TypeError``) so batch routes can isolate the offending
+item in its own slot instead of aborting the whole request.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +15,7 @@ from risk_engine.api.schemas import (
     MarketDataSchema,
     PortfolioSchema,
 )
+from risk_engine.errors import InvalidInputError
 from risk_engine.models import (
     CorrelationAssumption,
     FactorShock,
@@ -32,8 +38,16 @@ def to_portfolio(schema: PortfolioSchema) -> Portfolio:
 
 
 def to_market(schema: MarketDataSchema) -> MarketData:
+    dates: list[date] = []
+    for raw in schema.dates:
+        try:
+            dates.append(date.fromisoformat(raw))
+        except (ValueError, TypeError) as exc:
+            raise InvalidInputError(
+                f"market date {raw!r} is not a valid ISO date (YYYY-MM-DD)"
+            ) from exc
     return MarketData(
-        dates=tuple(date.fromisoformat(d) for d in schema.dates),
+        dates=tuple(dates),
         prices={inst: list(series) for inst, series in schema.prices.items()},
     )
 

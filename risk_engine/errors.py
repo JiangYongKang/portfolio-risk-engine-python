@@ -38,6 +38,17 @@ class InvalidParameterError(RiskEngineError):
     code = "INVALID_PARAMETER"
 
 
+class InvalidInputError(RiskEngineError):
+    """Malformed input payload (e.g. unparseable date, wrong shape).
+
+    Distinct from semantic rejections (unknown names, bad matrices): the
+    payload itself could not be read.  In batches only the offending slot
+    fails with this code; every other slot is unaffected.
+    """
+
+    code = "INVALID_INPUT"
+
+
 class UnknownInstrumentError(RiskEngineError):
     code = "UNKNOWN_INSTRUMENT"
 
@@ -102,3 +113,38 @@ class ComputationError(RiskEngineError):
     """Wraps unexpected numeric failures so raw exceptions never leak."""
 
     code = "COMPUTATION_ERROR"
+
+
+# --- failure classes ---------------------------------------------------------
+#
+# Every failure code maps to exactly one coarse class so callers can tell
+# the four failure kinds apart at a glance:
+#
+# * ``invalid_input``  — the request itself is malformed or inconsistent
+#   (bad dates, unknown names, invalid matrices, bad parameters, ...);
+# * ``timeout``        — the item did not finish within the time budget;
+# * ``over_limit``     — a declared resource limit was exceeded;
+# * ``internal_error`` — an unexpected engine-side failure (already wrapped).
+
+CLASS_INVALID_INPUT = "invalid_input"
+CLASS_TIMEOUT = "timeout"
+CLASS_OVER_LIMIT = "over_limit"
+CLASS_INTERNAL_ERROR = "internal_error"
+
+_CLASS_BY_CODE = {
+    "EVALUATION_TIMEOUT": CLASS_TIMEOUT,
+    "BATCH_SIZE_LIMIT": CLASS_OVER_LIMIT,
+    "RESOURCE_LIMIT_EXCEEDED": CLASS_OVER_LIMIT,
+    "COMPUTATION_ERROR": CLASS_INTERNAL_ERROR,
+    "INTERNAL_ERROR": CLASS_INTERNAL_ERROR,
+}
+
+
+def classify_failure(code: str) -> str:
+    """Coarse failure class for an error code.
+
+    Everything not explicitly timeout/over-limit/internal is an input
+    problem (the 422 family), so unknown codes default to
+    ``invalid_input``.
+    """
+    return _CLASS_BY_CODE.get(code, CLASS_INVALID_INPUT)

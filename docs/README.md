@@ -8,7 +8,7 @@
 
 ```bash
 uv sync                       # 安装依赖（含 pytest）
-uv run pytest tests/ -q       # 运行全部测试（64 例）
+uv run pytest tests/ -q       # 运行全部测试（99 例）
 uv run uvicorn main:app --reload   # 启动服务，默认 http://127.0.0.1:8000
 ```
 
@@ -144,12 +144,13 @@ curl -s -X POST http://127.0.0.1:8000/api/risk/scenarios/evaluate \
   返回顺序与提交顺序严格一致，与并行度无关，且与逐个单跑的结果
   完全一致。
 - 单条失败（如情景名未注册 `UNKNOWN_SCENARIO`、标的未持有
-  `UNKNOWN_INSTRUMENT`）只占用自己的槽位，其余条目照常出结果。
+  `UNKNOWN_INSTRUMENT`、该 job 输入非法 `INVALID_INPUT`）只占用自己的
+  槽位，其余条目照常出结果。
 - 条目数上限按**展开后的 (组合 × 情景) 对数**计：超限整批拒绝
   `BATCH_SIZE_LIMIT`；总时限到点未完成的对标记 `EVALUATION_TIMEOUT`，
   已完成的对保留。
-- 四类失败可区分：超时 `EVALUATION_TIMEOUT`、超容量
-  `BATCH_SIZE_LIMIT`、输入非法（如 `UNKNOWN_SCENARIO` 等 422 族）、
+- 四类失败可区分（详见「失败分类」）：超时 `EVALUATION_TIMEOUT`、
+  超容量 `BATCH_SIZE_LIMIT`、输入非法（`INVALID_INPUT` 等 422 族）、
   内部错误 `COMPUTATION_ERROR`。
 
 ## 跨版本批量重算对比
@@ -170,20 +171,73 @@ curl -s -X POST http://127.0.0.1:8000/api/risk/scenarios/evaluate \
 
 - `POST /api/risk/scan/snapshot` 或 `RiskService.scan_snapshot`：跑一次
   扫描并把结果冻结成一份自包含快照（`format:
-  risk-engine-snapshot/1`）。
-- **确定性**：相同输入重复跑任意多次、任意并行度，快照序列化结果
-  逐位一致。需要字节级稳定导出时用
+  risk-engine-snapshot/1`，JSON）。
+- `POST /api/risk/scan/snapshot/export`：同一份快照的**纯文本可读版**
+  （`text/plain`；库内为 `risk_engine.snapshot.render_snapshot_text`）。
+  本地打开即可直接阅读，无需再解析 JSON。
+
+### 快照里能看到什么
+
+每条目（entry）都携带：
+
+- **输入概况** `input_summary`：组合名、情景名、持仓数、行情天数；
+- **规则版本** `version`：得出该结论所用的规则版本戳（评估前就被拒
+  的条目为空串）；
+- **判定理由** `rationale`：成功条目说明「哪个情景、在哪套规则下、
+  对哪个组合、PnL 多少、是否与单因子自洽」；被拒条目说明
+  「`rejected: <错误码> — <原因>`」；
+- **失败分类** `failure_class`：见下文「失败分类」，成功条目为 null。
+
+文本版快照分三段：头部（格式版本、条目总数、成功/失败计数）、
+排名段（两个最差情形榜）、条目段（每条 `[序号] OK|FAILED [分类] |
+输入概况` + `why:` 判定理由 + 结果或错误详情）。
+
+### 确定性（可归档、可比对）
+
+- 相同输入重复跑任意多次、任意并行度，快照序列化结果**逐位一致**；
+  文本版同样逐位一致（不含时间戳等运行期数据）。
+- 字节级稳定导出：JSON 用
   `risk_engine.snapshot.canonical_json(snapshot)`（键排序、浮点按
-  最短可还原表示、拒绝 NaN/Infinity）。
-- 每条目携带：输入概况（组合/情景/持仓数/行情天数）、规则版本戳、
-  判定理由（`rationale`，说明结论如何得出或为何被拒）。
-- 排名（`rankings`）：
-  - `worst_by_portfolio` — 每个组合在其所有情景下的最差（最小）
-    PnL，按该值升序排（亏得最多的在前）；
-  - `worst_by_scenario` — 每个情景在所有组合下的最差 PnL，同理；
-  - 口径在载荷中明示：`metric: pnl`、`order: ascending`；并列时按
-    **名称字典序、再按首次提交下标**（`tie_break` 字段说明），因此
-    同一批输入每次排名完全相同。失败条目不参与排名。
+  最短可还原表示、拒绝 NaN/Infinity）；文本直接用
+  `render_snapshot_text(snapshot)` 或 `/scan/snapshot/export` 的响应体。
+- 时限截断时**已完成条目原样保留**：快照中已完成条目的内容与充裕
+  时限下跑出的同批结果逐位一致，只有真正未完成的条目被标记为
+  `EVALUATION_TIMEOUT`，不会被丢弃或改写。
+
+### 排名（rankings）
+
+- `worst_by_portfolio` — 每个组合在其所有情景下的最差（最小）
+  PnL，按该值升序排（亏得最多的在前）；
+- `worst_by_scenario` — 每个情景在所有组合下的最差 PnL，同理；
+- 口径在载荷中明示：`metric: pnl`、`order: ascending`；并列时按
+  **名称字典序、再按首次提交下标**（`tie_break` 字段说明），因此
+  同一批输入每次排名完全相同。失败条目不参与排名。
+
+## 失败分类（四类一眼可分）
+
+每个失败条目的错误码都归入唯一的粗分类
+（`risk_engine.errors.classify_failure`，快照条目带 `failure_class`
+字段）：
+
+| failure_class | 含义 | 代表错误码 |
+|---|---|---|
+| `invalid_input` | 输入本身非法/不一致（含解析失败与语义拒绝） | `INVALID_INPUT`、`INVALID_PARAMETER`、`INSUFFICIENT_DATA`、`UNKNOWN_*`、矩阵校验族 |
+| `timeout` | 超出时间预算 | `EVALUATION_TIMEOUT` |
+| `over_limit` | 超出声明的资源上限 | `BATCH_SIZE_LIMIT`、`RESOURCE_LIMIT_EXCEEDED` |
+| `internal_error` | 引擎内部失败（已包装，不透出细节） | `COMPUTATION_ERROR`、`INTERNAL_ERROR` |
+
+其中 `INVALID_INPUT` 专指**载荷本身无法解读**（如日期写法不合法），
+与「能读懂但被规则拒绝」（如情景名未注册）区分开，两者同属
+`invalid_input` 大类。
+
+### 单条坏输入不拖垮整批
+
+- `/batch`、`/scan`、`/scan/snapshot`、`/scan/snapshot/export`、
+  `/reassess` 均逐条解析输入：某一条（或扫描中的某一个 job）输入
+  非法时，**只有它自己的槽位**被标记 `INVALID_INPUT`（或对应的
+  具体错误码），其余条目照常出结果，返回顺序与提交顺序严格一致。
+- 扫描中一个 job 解析失败时，按它列出的每个情景名各产生一个失败
+  槽位，保持「组合 × 情景」展开后的下标不错位。
 
 ## 批量上限与时限配置
 
@@ -208,6 +262,7 @@ HTTP 请求体示例（`/scan`、`/reassess`、`/batch` 同构）：
 | `INSUFFICIENT_DATA` | 历史不足/窗口超过样本/非正价格/序列不齐 | 422 |
 | `INVALID_WINDOW` | window<1、horizon<1 | 422 |
 | `INVALID_PARAMETER` | 置信度越界、冲突入参 | 422 |
+| `INVALID_INPUT` | 载荷本身无法解读（如日期写法不合法） | 422 |
 | `UNKNOWN_INSTRUMENT` | 标的无行情或未持有 | 422 |
 | `UNKNOWN_SCENARIO` | 情景名称未注册 | 422 |
 | `UNKNOWN_ASSUMPTION` | 相关性假设名称未注册 | 422 |
@@ -225,7 +280,8 @@ HTTP 请求体示例（`/scan`、`/reassess`、`/batch` 同构）：
 ## 本地验证方法
 
 ```bash
-# 全量测试（含非法相关性、极端情景、并发批量、扫描、跨版本对比、快照）
+# 全量测试（含非法相关性、极端情景、并发批量、扫描、跨版本对比、快照、
+# 坏输入隔离、失败分类、可读导出）
 # 默认即打印每个用例的输入摘要与判定依据，无需额外参数
 uv run pytest tests/ -q
 
@@ -235,6 +291,25 @@ uv run pytest tests/test_batch.py -q
 uv run pytest tests/test_scan.py -q
 uv run pytest tests/test_reassess.py -q
 uv run pytest tests/test_snapshot.py -q
+uv run pytest tests/test_api.py -q
+```
+
+手动验证可读快照导出（服务启动后）：
+
+```bash
+# 先注册一个情景，再导出文本快照（可直接阅读、可归档比对）
+curl -s -X POST http://127.0.0.1:8000/api/risk/scenarios \
+  -H 'Content-Type: application/json' -d '{"name": "eq_drop",
+    "shocks": [{"instrument": "A", "relative_move": -0.1}]}'
+curl -s -X POST http://127.0.0.1:8000/api/risk/scan/snapshot/export \
+  -H 'Content-Type: application/json' -d '{"jobs": [{
+    "portfolio": {"name": "fund-x",
+      "holdings": [{"instrument": "A", "quantity": 10}]},
+    "market": {"dates": ["2026-01-01", "2026-01-02"],
+               "prices": {"A": [100, 102]}},
+    "scenario_names": ["eq_drop"]}]}' > snapshot.txt
+# 重复导出并比对：两次应逐位一致
+diff snapshot.txt snapshot.txt && echo identical
 ```
 
 测试日志约定：每个用例通过 `log.info("case=...; criterion: ...")`
@@ -244,9 +319,10 @@ uv run pytest tests/test_snapshot.py -q
 
 ## 与既有能力的兼容范围
 
-- 新增的 `/scan`、`/scan/snapshot`、`/reassess` 端点与
-  `RiskService.scan / scan_snapshot / batch_reassess` 均为**纯增量**，
-  不改变 `/assess`、`/batch`、情景与相关性端点的既有行为。
+- 新增的 `/scan`、`/scan/snapshot`、`/scan/snapshot/export`、
+  `/reassess` 端点与 `RiskService.scan / scan_snapshot / batch_reassess`
+  均为**纯增量**，不改变 `/assess`、`/batch`、情景与相关性端点的既有
+  行为。
 - 快照格式独立版本化（`risk-engine-snapshot/1`），与规则版本
   （`v1`/`v2`/...）正交：规则版本戳在每条目内，快照格式版本在
   文档头部。

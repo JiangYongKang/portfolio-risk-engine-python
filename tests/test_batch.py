@@ -142,6 +142,30 @@ def test_empty_batch_returns_empty():
     assert out == []
 
 
+def test_failure_classes_cover_four_distinguishable_kinds():
+    from risk_engine.errors import classify_failure
+
+    mapping = {
+        "EVALUATION_TIMEOUT": "timeout",
+        "BATCH_SIZE_LIMIT": "over_limit",
+        "RESOURCE_LIMIT_EXCEEDED": "over_limit",
+        "INVALID_INPUT": "invalid_input",
+        "INVALID_PARAMETER": "invalid_input",
+        "UNKNOWN_SCENARIO": "invalid_input",
+        "INSUFFICIENT_DATA": "invalid_input",
+        "COMPUTATION_ERROR": "internal_error",
+        "INTERNAL_ERROR": "internal_error",
+    }
+    classes = {code: classify_failure(code) for code in mapping}
+    log.info(
+        "case=failure-class-map %s; criterion: timeout/over_limit/"
+        "invalid_input/internal_error are four distinct classes",
+        classes,
+    )
+    assert classes == mapping
+    assert len(set(classes.values())) == 4
+
+
 def test_concurrent_execution_actually_overlaps():
     # Demonstrates real concurrency: 8 sleeps of 0.1s with 8 workers must
     # finish much faster than serial (0.8s).

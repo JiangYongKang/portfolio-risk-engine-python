@@ -267,3 +267,163 @@ def test_scan_snapshot_endpoint_deterministic():
     assert d["rankings"]["worst_by_portfolio"]["items"][0]["name"] == "fund-p"
     assert d["rankings"]["worst_by_scenario"]["items"][0]["name"] == "snap_drop"
     assert "rationale" in d["entries"][0]
+
+
+def test_batch_bad_date_isolated_http():
+    good = _valid_body()
+    bad = _valid_body()
+    bad["market"] = {"dates": ["2026-13-99"], "prices": {"A": [1.0]}}
+    r = client.post("/api/risk/batch", json={"requests": [good, bad, good]})
+    d = r.json()
+    flags = [(x["index"], x["ok"], (x["error"] or {}).get("code"))
+             for x in d["results"]]
+    log.info(
+        "case=http-batch-bad-date flags=%s; criterion: only the malformed "
+        "slot fails with INVALID_INPUT, order preserved",
+        flags,
+    )
+    assert r.status_code == 200
+    assert flags == [(0, True, None), (1, False, "INVALID_INPUT"), (2, True, None)]
+
+
+def test_scan_bad_date_job_isolated_http():
+    client.post(
+        "/api/risk/scenarios",
+        json={"name": "iso_drop",
+              "shocks": [{"instrument": "A", "relative_move": -0.1}]},
+    )
+    good_job = {
+        "portfolio": {"name": "iso-ok",
+                      "holdings": [{"instrument": "A", "quantity": 2}]},
+        "market": {"dates": _dates(3), "prices": {"A": [10.0, 11.0, 12.0]}},
+        "scenario_names": ["iso_drop"],
+    }
+    bad_job = {
+        "portfolio": {"name": "iso-broken",
+                      "holdings": [{"instrument": "A", "quantity": 1}]},
+        "market": {"dates": ["not-a-date"], "prices": {"A": [1.0]}},
+        "scenario_names": ["iso_drop", "iso_drop"],
+    }
+    r = client.post("/api/risk/scan",
+                    json={"jobs": [good_job, bad_job, good_job]})
+    flags = [(x["index"], x["ok"], (x["error"] or {}).get("code"))
+             for x in r.json()["results"]]
+    log.info(
+        "case=http-scan-bad-date flags=%s; criterion: broken job fails its "
+        "own two slots only, others unaffected",
+        flags,
+    )
+    assert r.status_code == 200
+    assert flags == [
+        (0, True, None),
+        (1, False, "INVALID_INPUT"),
+        (2, False, "INVALID_INPUT"),
+        (3, True, None),
+    ]
+    # the failure lands in the snapshot with summary, rationale, class
+    r2 = client.post("/api/risk/scan/snapshot",
+                     json={"jobs": [good_job, bad_job]})
+    entries = r2.json()["entries"]
+    broken = entries[1]
+    log.info(
+        "case=http-scan-bad-date-snapshot entry=%s; criterion: failed entry "
+        "carries summary + INVALID_INPUT rationale + failure_class",
+        {k: broken[k] for k in ("ok", "failure_class", "rationale")},
+    )
+    assert broken["ok"] is False
+    assert broken["failure_class"] == "invalid_input"
+    assert "INVALID_INPUT" in broken["rationale"]
+    assert broken["input_summary"]["portfolio"] == "iso-broken"
+    assert entries[0]["ok"] is True and entries[0]["version"] == "v1"
+
+
+def test_reassess_bad_date_isolated_http():
+    body = _valid_body()
+    original = client.post("/api/risk/assess", json=body).json()
+
+    def job(market):
+        return {
+            "portfolio": body["portfolio"],
+            "market": market,
+            "stamped_version": "v1",
+            "target_version": "v1",
+            "original": original,
+            "window": body["window"],
+        }
+
+    bad_market = {"dates": ["2026-02-30"], "prices": body["market"]["prices"]}
+    r = client.post("/api/risk/reassess",
+                    json={"jobs": [job(body["market"]), job(bad_market)]})
+    flags = [(x["index"], x["ok"], (x["error"] or {}).get("code"))
+             for x in r.json()["results"]]
+    log.info(
+        "case=http-reassess-bad-date flags=%s; criterion: bad date fails "
+        "only its own slot with INVALID_INPUT",
+        flags,
+    )
+    assert r.status_code == 200
+    assert flags == [(0, True, None), (1, False, "INVALID_INPUT")]
+    assert r.json()["results"][0]["result"]["verdict"] == "REPRODUCED"
+
+
+def test_scan_snapshot_export_endpoint_readable_and_byte_stable():
+    client.post(
+        "/api/risk/scenarios",
+        json={"name": "exp_drop",
+              "shocks": [{"instrument": "A", "relative_move": -0.1}]},
+    )
+    body = {
+        "jobs": [{
+            "portfolio": {"name": "exp-fund",
+                          "holdings": [{"instrument": "A", "quantity": 4}]},
+            "market": {"dates": _dates(3), "prices": {"A": [10.0, 11.0, 12.0]}},
+            "scenario_names": ["exp_drop"],
+        }]
+    }
+    r1 = client.post("/api/risk/scan/snapshot/export", json=body)
+    r2 = client.post("/api/risk/scan/snapshot/export", json=body)
+    log.info(
+        "case=http-export status=%s bytes=%d; criterion: readable text, "
+        "byte-identical across repeated exports",
+        r1.status_code, len(r1.content),
+    )
+    assert r1.status_code == 200
+    assert r1.headers["content-type"].startswith("text/plain")
+    assert r1.content == r2.content
+    text = r1.text
+    assert text.startswith("# Risk Engine Scan Snapshot")
+    assert "format: risk-engine-snapshot/1" in text
+    assert "portfolio=exp-fund" in text and "scenario=exp_drop" in text
+    assert "rules=v1" in text and "why:" in text
+    assert "### worst_by_portfolio" in text
+
+
+def test_assess_validation_boundary_http():
+    bad_conf = _valid_body()
+    bad_conf["confidence"] = 1.5
+    r1 = client.post("/api/risk/assess", json=bad_conf)
+    bad_window = _valid_body()
+    bad_window["window"] = 0
+    r2 = client.post("/api/risk/assess", json=bad_window)
+    log.info(
+        "case=http-validation confidence=1.5 -> %s, window=0 -> %s; "
+        "criterion: both rejected 422",
+        r1.status_code, r2.status_code,
+    )
+    assert r1.status_code == 422
+    assert r2.status_code == 422
+
+
+def test_batch_and_scan_empty_http():
+    r1 = client.post("/api/risk/batch", json={"requests": []})
+    r2 = client.post("/api/risk/scan", json={"jobs": []})
+    r3 = client.post("/api/risk/scan/snapshot", json={"jobs": []})
+    log.info(
+        "case=http-empty batch=%s scan=%s snapshot=%s; criterion: empty in, "
+        "well-formed empty out",
+        r1.status_code, r2.status_code, r3.status_code,
+    )
+    assert r1.status_code == 200 and r1.json() == {"count": 0, "results": []}
+    assert r2.status_code == 200 and r2.json() == {"count": 0, "results": []}
+    assert r3.status_code == 200
+    assert r3.json()["count"] == 0 and r3.json()["entries"] == []

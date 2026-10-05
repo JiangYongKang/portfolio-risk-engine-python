@@ -34,8 +34,13 @@ from risk_engine.scenarios import (
     compose_scenarios,
     evaluate_scenario,
 )
-from risk_engine.scan import ScanJob, expand_pairs
-from risk_engine.snapshot import SnapshotEntry, build_snapshot, rank_worst
+from risk_engine.scan import ScanItem, ScanJob, expand_items, expand_pairs
+from risk_engine.snapshot import (
+    SnapshotEntry,
+    build_snapshot,
+    entry_from_result,
+    rank_worst,
+)
 from risk_engine.versions import RulesVersion, VersionRegistry, default_registry
 
 
@@ -241,10 +246,17 @@ class RiskService:
 
         Results are flattened in submission order (portfolio-major).  An
         unknown scenario name or a failing pair occupies only its own
-        slot; every other pair is unaffected.
+        slot; every other pair is unaffected.  Jobs may also be
+        ``InvalidScanJob`` placeholders (unparseable raw input): each
+        expands into failed slots carrying the typed input error.
         """
-        pairs = expand_pairs(jobs)
-        return run_batch(pairs, self._run_scan_pair, limits)
+        return self.run_scan_items(expand_items(list(jobs)), limits)
+
+    def run_scan_items(
+        self, items: list[ScanItem], limits: BatchLimits | None = None
+    ) -> list[BatchItemResult]:
+        """Run already-expanded scan items as one ordered batch."""
+        return run_batch(items, self._run_scan_item, limits)
 
     def scan_snapshot(
         self, jobs: list[ScanJob], limits: BatchLimits | None = None
@@ -254,47 +266,32 @@ class RiskService:
         The returned document is deterministic: serialize it with
         ``risk_engine.snapshot.canonical_json`` for byte-stable export.
         """
-        pairs = expand_pairs(jobs)
-        results = run_batch(pairs, self._run_scan_pair, limits)
-        entries: list[SnapshotEntry] = []
-        for (portfolio, market, scenario_name), item in zip(pairs, results):
-            summary = {
-                "portfolio": portfolio.name,
-                "scenario": scenario_name,
-                "holdings": len(portfolio.holdings),
-                "dates": len(market.dates),
-            }
-            if item.ok:
-                version = item.result["version"]
-                rationale = (
-                    f"scenario '{scenario_name}' evaluated under rules "
-                    f"{version} on portfolio '{portfolio.name}': "
-                    f"pnl={item.result['pnl']!r}; "
-                    f"consistent_with_single_factor="
-                    f"{item.result['consistent_with_single_factor']}"
-                )
-            else:
-                version = ""
-                rationale = (
-                    f"rejected: {item.error['code']} — {item.error['reason']}"
-                )
-            entries.append(
-                SnapshotEntry(
-                    index=item.index,
-                    kind="scenario",
-                    input_summary=summary,
-                    version=version,
-                    ok=item.ok,
-                    rationale=rationale,
-                    result=item.result,
-                    error=item.error,
-                )
+        return self.snapshot_items(expand_items(list(jobs)), limits)
+
+    def snapshot_items(
+        self, items: list[ScanItem], limits: BatchLimits | None = None
+    ) -> dict:
+        """Snapshot over already-expanded scan items (see scan_snapshot)."""
+        results = self.run_scan_items(items, limits)
+        entries: list[SnapshotEntry] = [
+            entry_from_result(
+                item_result.index,
+                kind="scenario",
+                input_summary=scan_item.input_summary,
+                item=item_result,
             )
+            for scan_item, item_result in zip(items, results)
+        ]
         rankings = {
             "worst_by_portfolio": rank_worst(entries, group_by="portfolio"),
             "worst_by_scenario": rank_worst(entries, group_by="scenario"),
         }
         return build_snapshot(entries, rankings=rankings)
+
+    def _run_scan_item(self, item: ScanItem) -> dict:
+        if item.error is not None:
+            raise item.error  # pre-failed slot: typed input error
+        return self._run_scan_pair((item.portfolio, item.market, item.scenario_name))
 
     def _run_scan_pair(self, pair: tuple) -> dict:
         portfolio, market, scenario_name = pair

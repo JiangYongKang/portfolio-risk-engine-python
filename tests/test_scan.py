@@ -116,3 +116,56 @@ def test_scan_timeout_marks_only_unfinished(svc, market, monkeypatch):
     assert out[0].ok and out[0].result["scenario"] == "eq_drop"
     assert out[1].ok is False and out[1].error["code"] == "EVALUATION_TIMEOUT"
     assert out[2].ok and out[2].result["scenario"] == "c_shock"
+
+
+def test_invalid_scan_job_fails_only_its_own_slots(svc, market):
+    from risk_engine.errors import InvalidInputError
+    from risk_engine.scan import InvalidScanJob
+
+    bad_input = InvalidInputError(
+        "market date '2026-13-99' is not a valid ISO date (YYYY-MM-DD)"
+    )
+    jobs = [
+        ScanJob(Portfolio("ok-1", (Holding("A", 1.0), Holding("B", 1.0))),
+                market, ("eq_drop", "combo")),
+        InvalidScanJob("broken", 1, 0, ("eq_drop", "c_shock"), bad_input),
+        ScanJob(Portfolio("ok-2", (Holding("C", 2.0),)), market, ("c_shock",)),
+    ]
+    out = svc.scan(jobs, BatchLimits(max_items=8, timeout_seconds=5))
+    flags = [(r.ok, None if r.ok else r.error["code"]) for r in out]
+    log.info(
+        "case=invalid-job-isolation flags=%s; criterion: only the broken "
+        "job's slots fail with INVALID_INPUT, order preserved",
+        flags,
+    )
+    assert flags == [
+        (True, None),
+        (True, None),
+        (False, "INVALID_INPUT"),
+        (False, "INVALID_INPUT"),
+        (True, None),
+    ]
+    assert [r.index for r in out] == list(range(5))
+    # the failure also lands in the snapshot with summary + rationale
+    snap = svc.scan_snapshot(jobs, BatchLimits(max_items=8, timeout_seconds=5))
+    broken = snap["entries"][2]
+    assert broken["ok"] is False
+    assert broken["failure_class"] == "invalid_input"
+    assert broken["input_summary"]["portfolio"] == "broken"
+    assert "INVALID_INPUT" in broken["rationale"]
+    assert snap["entries"][4]["ok"] is True
+
+
+def test_scan_empty_jobs_and_empty_scenario_names(svc, market):
+    no_jobs = svc.scan([], BatchLimits(timeout_seconds=5))
+    job_no_scenarios = ScanJob(Portfolio("p", (Holding("A", 1.0),)), market, ())
+    no_pairs = svc.scan([job_no_scenarios], BatchLimits(timeout_seconds=5))
+    snap = svc.scan_snapshot([job_no_scenarios], BatchLimits(timeout_seconds=5))
+    log.info(
+        "case=empty-scan jobs=0/1(scenarios=0); criterion: empty in, empty "
+        "out, well-formed empty snapshot"
+    )
+    assert no_jobs == [] and no_pairs == []
+    assert snap["count"] == 0 and snap["entries"] == []
+    assert snap["rankings"]["worst_by_portfolio"]["items"] == []
+    assert snap["rankings"]["worst_by_scenario"]["items"] == []

@@ -15,6 +15,7 @@ from risk_engine.snapshot import (
     build_snapshot,
     canonical_json,
     rank_worst,
+    render_snapshot_text,
 )
 
 from .conftest import log
@@ -119,3 +120,106 @@ def test_canonical_json_stable_and_rejects_nan():
     assert canonical_json(obj).startswith('{"a"')
     with pytest.raises(ValueError):
         canonical_json({"x": float("nan")})
+
+
+def test_rendered_snapshot_is_readable_and_byte_stable(svc, market):
+    jobs = _jobs(market) + [
+        ScanJob(Portfolio("g", (Holding("A", 1.0),)), market, ("ghost",))
+    ]
+    texts = {
+        render_snapshot_text(
+            svc.scan_snapshot(jobs, BatchLimits(max_workers=w, timeout_seconds=10))
+        )
+        for w in (1, 4, 8)
+    }
+    log.info(
+        "case=render-readable jobs=%d workers=1/4/8; criterion: one byte "
+        "string, header/summary/version/rationale/rejection all visible",
+        len(jobs),
+    )
+    assert len(texts) == 1
+    text = texts.pop()
+    # document header: format + ok/failed tally
+    assert text.startswith("# Risk Engine Scan Snapshot")
+    assert "format: risk-engine-snapshot/1" in text
+    assert "entries: 7 (ok=6, failed=1)" in text
+    # per-entry: input summary, rules version, rationale
+    assert "portfolio=alpha" in text and "scenario=eq_drop" in text
+    assert "rules=v1" in text
+    assert "why: scenario 'eq_drop' evaluated under rules v1" in text
+    # rejection: reason + coarse failure class visible at a glance
+    assert "FAILED [invalid_input]" in text
+    assert "rejected: UNKNOWN_SCENARIO" in text
+    # rankings section present and ordered worst-first
+    assert "### worst_by_portfolio" in text
+    assert "1. alpha" in text
+    # no run-dependent bytes: re-rendering a re-run is identical
+    again = render_snapshot_text(
+        svc.scan_snapshot(jobs, BatchLimits(max_workers=2, timeout_seconds=10))
+    )
+    assert again == text
+
+
+def test_snapshot_keeps_completed_entries_under_deadline(svc, market, monkeypatch):
+    import time
+
+    real = svc._run_scan_pair
+
+    def slow_pair(pair):
+        if pair[2] == "b_rally":
+            time.sleep(0.3)
+        return real(pair)
+
+    monkeypatch.setattr(svc, "_run_scan_pair", slow_pair)
+    jobs = _jobs(market)  # 6 pairs; b_rally pairs are slow
+    tight = svc.scan_snapshot(jobs, BatchLimits(max_workers=6, timeout_seconds=0.15))
+    generous = svc.scan_snapshot(jobs, BatchLimits(max_workers=6, timeout_seconds=10))
+    timed_out = [e for e in tight["entries"] if not e["ok"]]
+    log.info(
+        "case=snapshot-deadline timed_out=%d; criterion: slow pairs marked "
+        "timeout, completed pairs byte-identical to the generous run",
+        len(timed_out),
+    )
+    assert len(timed_out) == 2
+    assert all(e["error"]["code"] == "EVALUATION_TIMEOUT" for e in timed_out)
+    assert all(e["failure_class"] == "timeout" for e in timed_out)
+    assert all(e["input_summary"]["scenario"] == "b_rally" for e in timed_out)
+    # completed entries are kept as-is, never dropped or rewritten
+    for entry in tight["entries"]:
+        if entry["ok"]:
+            twin = generous["entries"][entry["index"]]
+            assert canonical_json(entry) == canonical_json(twin)
+
+
+def test_snapshot_failure_classes_are_distinguishable(svc, market, monkeypatch):
+    real = svc._run_scan_pair
+
+    def flaky(pair):
+        if pair[2] == "mixed":
+            raise RuntimeError("internal numeric kaboom")
+        return real(pair)
+
+    monkeypatch.setattr(svc, "_run_scan_pair", flaky)
+    jobs = [
+        ScanJob(
+            Portfolio("g", (Holding("A", 1.0), Holding("C", 1.0))),
+            market,
+            ("eq_drop", "ghost", "mixed"),
+        )
+    ]
+    snap = svc.scan_snapshot(jobs, BatchLimits(timeout_seconds=5))
+    classes = {
+        e["input_summary"]["scenario"]: (e["failure_class"], e["ok"])
+        for e in snap["entries"]
+    }
+    log.info(
+        "case=failure-classes %s; criterion: ok=None, unknown-name="
+        "invalid_input, wrapped-internal=internal_error",
+        classes,
+    )
+    assert classes == {
+        "eq_drop": (None, True),
+        "ghost": ("invalid_input", False),
+        "mixed": ("internal_error", False),
+    }
+    assert snap["entries"][2]["error"]["code"] == "COMPUTATION_ERROR"

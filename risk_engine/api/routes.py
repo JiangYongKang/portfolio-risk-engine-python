@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from risk_engine.errors import (
     ComputationError,
@@ -66,6 +66,45 @@ def _resolve_correlation(svc, payload):
     if payload.correlation_name:
         return svc.get_correlation(payload.correlation_name)
     return None
+
+
+def _as_typed_error(err: Exception) -> RiskEngineError:
+    """Wrap unexpected resolution failures; typed errors pass through."""
+    if isinstance(err, RiskEngineError):
+        return err
+    return ComputationError(f"unexpected resolution failure: {err}")
+
+
+def _resolve_scan_jobs(payload) -> list:
+    """Resolve each scan job independently.
+
+    A job whose raw inputs cannot be parsed (e.g. a malformed market
+    date) becomes an ``InvalidScanJob`` carrying the typed error: it
+    fails only its own expanded slots, never the whole scan.
+    """
+    from risk_engine.scan import InvalidScanJob, ScanJob
+
+    jobs: list = []
+    for j in payload.jobs:
+        try:
+            jobs.append(
+                ScanJob(
+                    portfolio=to_portfolio(j.portfolio),
+                    market=to_market(j.market),
+                    scenario_names=tuple(j.scenario_names),
+                )
+            )
+        except Exception as err:
+            jobs.append(
+                InvalidScanJob(
+                    portfolio_name=j.portfolio.name,
+                    holdings=len(j.portfolio.holdings),
+                    dates=len(j.market.dates),
+                    scenario_names=tuple(j.scenario_names),
+                    error=_as_typed_error(err),
+                )
+            )
+    return jobs
 
 
 def _summary(payload) -> dict:
@@ -134,9 +173,9 @@ def batch(payload: BatchAssessRequest, request: Request):
     for i, req in enumerate(payload.requests):
         try:
             jobs.append(to_job(req, _resolve_correlation(svc, req)))
-        except RiskEngineError as err:
+        except Exception as err:
             jobs.append(None)
-            pre_failures[i] = err.to_dict()
+            pre_failures[i] = _as_typed_error(err).to_dict()
     try:
         results = svc.batch_assess([j for j in jobs if j is not None], limits)
     except RiskEngineError as err:
@@ -174,20 +213,12 @@ def scan(payload: ScanRequest, request: Request):
     )
     svc = _service(request)
     from risk_engine.batch import BatchLimits
-    from risk_engine.scan import ScanJob
 
     limits = BatchLimits(
         max_items=payload.max_items or BatchLimits().max_items,
         timeout_seconds=payload.timeout_seconds or BatchLimits().timeout_seconds,
     )
-    jobs = [
-        ScanJob(
-            portfolio=to_portfolio(j.portfolio),
-            market=to_market(j.market),
-            scenario_names=tuple(j.scenario_names),
-        )
-        for j in payload.jobs
-    ]
+    jobs = _resolve_scan_jobs(payload)
     try:
         results = svc.scan(jobs, limits)
     except RiskEngineError as err:
@@ -207,24 +238,40 @@ def scan_snapshot(payload: ScanRequest, request: Request):
     logger.info("scan snapshot request jobs=%d", len(payload.jobs))
     svc = _service(request)
     from risk_engine.batch import BatchLimits
-    from risk_engine.scan import ScanJob
 
     limits = BatchLimits(
         max_items=payload.max_items or BatchLimits().max_items,
         timeout_seconds=payload.timeout_seconds or BatchLimits().timeout_seconds,
     )
-    jobs = [
-        ScanJob(
-            portfolio=to_portfolio(j.portfolio),
-            market=to_market(j.market),
-            scenario_names=tuple(j.scenario_names),
-        )
-        for j in payload.jobs
-    ]
     try:
-        return svc.scan_snapshot(jobs, limits)
+        return svc.scan_snapshot(_resolve_scan_jobs(payload), limits)
     except RiskEngineError as err:
         return _error_response(err, _http_status(err))
+
+
+@router.post("/scan/snapshot/export")
+def scan_snapshot_export(payload: ScanRequest, request: Request):
+    """Run a scan and return a human-readable, byte-stable text snapshot.
+
+    The text rendering is deterministic (no timestamps): repeated exports
+    of the same inputs are byte-identical and safe to archive or diff.
+    """
+    logger.info("scan snapshot export request jobs=%d", len(payload.jobs))
+    svc = _service(request)
+    from risk_engine.batch import BatchLimits
+    from risk_engine.snapshot import render_snapshot_text
+
+    limits = BatchLimits(
+        max_items=payload.max_items or BatchLimits().max_items,
+        timeout_seconds=payload.timeout_seconds or BatchLimits().timeout_seconds,
+    )
+    try:
+        snapshot = svc.scan_snapshot(_resolve_scan_jobs(payload), limits)
+    except RiskEngineError as err:
+        return _error_response(err, _http_status(err))
+    return PlainTextResponse(
+        render_snapshot_text(snapshot), media_type="text/plain; charset=utf-8"
+    )
 
 
 @router.post("/reassess")
@@ -263,9 +310,9 @@ def reassess(payload: ReassessRequest, request: Request):
                     allow_breaking=j.allow_breaking,
                 )
             )
-        except RiskEngineError as err:
+        except Exception as err:
             jobs.append(None)
-            pre_failures[i] = err.to_dict()
+            pre_failures[i] = _as_typed_error(err).to_dict()
     try:
         results = svc.batch_reassess([j for j in jobs if j is not None], limits)
     except RiskEngineError as err:
