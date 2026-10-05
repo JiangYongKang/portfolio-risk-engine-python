@@ -35,7 +35,12 @@ from risk_engine.scenarios import (
     evaluate_scenario,
 )
 from risk_engine.scan import ScanJob, expand_pairs
-from risk_engine.snapshot import SnapshotEntry, build_snapshot, rank_worst
+from risk_engine.snapshot import (
+    SnapshotEntry,
+    build_snapshot,
+    rank_worst,
+    render_text,
+)
 from risk_engine.versions import RulesVersion, VersionRegistry, default_registry
 
 
@@ -234,6 +239,12 @@ class RiskService:
     ) -> list[BatchItemResult]:
         return run_batch(jobs, self._run_job, limits)
 
+    def scan_pairs(
+        self, pairs: list[tuple], limits: BatchLimits | None = None
+    ) -> list[BatchItemResult]:
+        """Run already-expanded (portfolio, market, scenario) pairs."""
+        return run_batch(pairs, self._run_scan_pair, limits)
+
     def scan(
         self, jobs: list[ScanJob], limits: BatchLimits | None = None
     ) -> list[BatchItemResult]:
@@ -243,21 +254,53 @@ class RiskService:
         unknown scenario name or a failing pair occupies only its own
         slot; every other pair is unaffected.
         """
-        pairs = expand_pairs(jobs)
-        return run_batch(pairs, self._run_scan_pair, limits)
+        return self.scan_pairs(expand_pairs(jobs), limits)
 
     def scan_snapshot(
-        self, jobs: list[ScanJob], limits: BatchLimits | None = None
+        self,
+        jobs: list[ScanJob],
+        limits: BatchLimits | None = None,
+        *,
+        failed_slots: dict[int, tuple[dict, dict]] | None = None,
     ) -> dict:
         """Run a scan and freeze the results into a ranked snapshot.
 
         The returned document is deterministic: serialize it with
         ``risk_engine.snapshot.canonical_json`` for byte-stable export.
+
+        ``failed_slots`` maps a *final* pair index to
+        ``(error_dict, input_summary)`` for pairs whose job could not
+        even be resolved (e.g. malformed market data): they appear in
+        the snapshot as rejected entries at their original positions,
+        while every resolvable pair is evaluated normally.
         """
         pairs = expand_pairs(jobs)
         results = run_batch(pairs, self._run_scan_pair, limits)
+        failed_slots = failed_slots or {}
+        total = len(pairs) + len(failed_slots)
         entries: list[SnapshotEntry] = []
-        for (portfolio, market, scenario_name), item in zip(pairs, results):
+        k = 0
+        for index in range(total):
+            if index in failed_slots:
+                error, summary = failed_slots[index]
+                entries.append(
+                    SnapshotEntry(
+                        index=index,
+                        kind="scenario",
+                        input_summary=summary,
+                        version="",
+                        ok=False,
+                        rationale=(
+                            f"rejected: {error['code']} — {error['reason']}"
+                        ),
+                        result=None,
+                        error=error,
+                    )
+                )
+                continue
+            portfolio, market, scenario_name = pairs[k]
+            item = results[k]
+            k += 1
             summary = {
                 "portfolio": portfolio.name,
                 "scenario": scenario_name,
@@ -280,7 +323,7 @@ class RiskService:
                 )
             entries.append(
                 SnapshotEntry(
-                    index=item.index,
+                    index=index,
                     kind="scenario",
                     input_summary=summary,
                     version=version,
@@ -295,6 +338,22 @@ class RiskService:
             "worst_by_scenario": rank_worst(entries, group_by="scenario"),
         }
         return build_snapshot(entries, rankings=rankings)
+
+    def scan_snapshot_text(
+        self,
+        jobs: list[ScanJob],
+        limits: BatchLimits | None = None,
+        *,
+        failed_slots: dict[int, tuple[dict, dict]] | None = None,
+    ) -> str:
+        """Run a scan and export a human-readable, byte-stable report.
+
+        The text contains no timestamps: repeated exports of the same
+        inputs (any worker count) are byte-identical.
+        """
+        return render_text(
+            self.scan_snapshot(jobs, limits, failed_slots=failed_slots)
+        )
 
     def _run_scan_pair(self, pair: tuple) -> dict:
         portfolio, market, scenario_name = pair

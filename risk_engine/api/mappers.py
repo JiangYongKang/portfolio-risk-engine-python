@@ -1,4 +1,10 @@
-"""Translate HTTP schemas into domain objects."""
+"""Translate HTTP schemas into domain objects.
+
+Any malformed raw input (e.g. an unparseable date string) is converted
+into a typed ``RiskEngineError`` here, at the boundary, so that in a
+batch only the offending item fails — raw ``ValueError``/``TypeError``
+from parsing never aborts the whole batch.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +16,7 @@ from risk_engine.api.schemas import (
     MarketDataSchema,
     PortfolioSchema,
 )
+from risk_engine.errors import InvalidInputError, RiskEngineError
 from risk_engine.models import (
     CorrelationAssumption,
     FactorShock,
@@ -22,18 +29,32 @@ from risk_engine.service import AssessmentJob
 
 
 def to_portfolio(schema: PortfolioSchema) -> Portfolio:
-    return Portfolio(
-        name=schema.name,
-        holdings=tuple(
-            Holding(instrument=h.instrument, quantity=float(h.quantity))
-            for h in schema.holdings
-        ),
-    )
+    try:
+        return Portfolio(
+            name=schema.name,
+            holdings=tuple(
+                Holding(instrument=h.instrument, quantity=float(h.quantity))
+                for h in schema.holdings
+            ),
+        )
+    except (TypeError, ValueError) as exc:
+        raise InvalidInputError(
+            f"portfolio '{schema.name}': malformed holding: {exc}"
+        ) from exc
+
+
+def _parse_date(raw: str) -> date:
+    try:
+        return date.fromisoformat(raw)
+    except (TypeError, ValueError) as exc:
+        raise InvalidInputError(
+            f"malformed date {raw!r}: expected ISO format 'YYYY-MM-DD'"
+        ) from exc
 
 
 def to_market(schema: MarketDataSchema) -> MarketData:
     return MarketData(
-        dates=tuple(date.fromisoformat(d) for d in schema.dates),
+        dates=tuple(_parse_date(d) for d in schema.dates),
         prices={inst: list(series) for inst, series in schema.prices.items()},
     )
 

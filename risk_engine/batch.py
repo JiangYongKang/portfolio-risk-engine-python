@@ -22,6 +22,7 @@ from time import perf_counter
 from risk_engine.errors import (
     BatchSizeLimitError,
     ComputationError,
+    EvaluationTimeoutError,
     RiskEngineError,
 )
 from risk_engine.models import BatchItemResult
@@ -88,11 +89,9 @@ def run_batch(
                 results[i] = BatchItemResult(
                     index=i,
                     ok=False,
-                    error={
-                        "code": "EVALUATION_TIMEOUT",
-                        "reason": f"batch time budget {limits.timeout_seconds}s "
-                        "exceeded",
-                    },
+                    error=EvaluationTimeoutError(
+                        f"batch time budget {limits.timeout_seconds}s exceeded"
+                    ).to_dict(),
                 )
                 continue
             try:
@@ -101,10 +100,9 @@ def run_batch(
                 results[i] = BatchItemResult(
                     index=i,
                     ok=False,
-                    error={
-                        "code": "EVALUATION_TIMEOUT",
-                        "reason": f"item exceeded time budget",
-                    },
+                    error=EvaluationTimeoutError(
+                        "item exceeded time budget"
+                    ).to_dict(),
                 )
                 continue
             results[idx] = BatchItemResult(
@@ -114,7 +112,7 @@ def run_batch(
                 error=error,
             )
 
-    return [r if r is not None else BatchItemResult(i, False, None, {
-        "code": "EVALUATION_TIMEOUT",
-        "reason": "no result produced",
-    }) for i, r in enumerate(results)]
+    return [r if r is not None else BatchItemResult(
+        i, False, None,
+        EvaluationTimeoutError("no result produced").to_dict(),
+    ) for i, r in enumerate(results)]

@@ -8,7 +8,7 @@
 
 ```bash
 uv sync                       # 安装依赖（含 pytest）
-uv run pytest tests/ -q       # 运行全部测试（64 例）
+uv run pytest tests/ -q       # 运行全部测试（99 例）
 uv run uvicorn main:app --reload   # 启动服务，默认 http://127.0.0.1:8000
 ```
 
@@ -130,6 +130,11 @@ curl -s -X POST http://127.0.0.1:8000/api/risk/scenarios/evaluate \
 - `POST /api/risk/batch` 或 `RiskService.batch_assess`。
 - 保证：输出顺序与请求顺序一致；并发结果与串行完全一致；单个请求
   失败只影响其自身槽位，其余结论不受影响。
+- **单条坏输入不拖垮整批**：某一条的日期写法不合法、window/置信度
+  越界、引用了未注册的名称等，只有那一条被判为输入非法
+  （`INVALID_INPUT` / `INVALID_WINDOW` / `INVALID_PARAMETER` 等），
+  其余条目照常出结果，顺序不乱。数值范围由引擎逐条校验（不在
+  schema 层整批拒绝），因此越界参数同样只占用自己的槽位。
 - 资源/时间上限：
   - 批量大小超限 → 整体拒绝 `BATCH_SIZE_LIMIT`（HTTP 429）；
   - 单项/整体超出时间预算 → 该槽位标记 `EVALUATION_TIMEOUT`；
@@ -144,13 +149,15 @@ curl -s -X POST http://127.0.0.1:8000/api/risk/scenarios/evaluate \
   返回顺序与提交顺序严格一致，与并行度无关，且与逐个单跑的结果
   完全一致。
 - 单条失败（如情景名未注册 `UNKNOWN_SCENARIO`、标的未持有
-  `UNKNOWN_INSTRUMENT`）只占用自己的槽位，其余条目照常出结果。
+  `UNKNOWN_INSTRUMENT`、行情日期写法不合法 `INVALID_INPUT`）只占
+  用自己的槽位：某个 job 的行情/组合数据无法解析时，它的每个情景
+  对在原位置得到一条带原因的拒绝，其余 job 的对照常求值，顺序
+  不乱。
 - 条目数上限按**展开后的 (组合 × 情景) 对数**计：超限整批拒绝
   `BATCH_SIZE_LIMIT`；总时限到点未完成的对标记 `EVALUATION_TIMEOUT`，
   已完成的对保留。
-- 四类失败可区分：超时 `EVALUATION_TIMEOUT`、超容量
-  `BATCH_SIZE_LIMIT`、输入非法（如 `UNKNOWN_SCENARIO` 等 422 族）、
-  内部错误 `COMPUTATION_ERROR`。
+- 四类失败一眼可分（见下文「失败类别」）：超时 `timeout`、超量
+  `resource_limit`、输入非法 `invalid_input`、内部错误 `internal`。
 
 ## 跨版本批量重算对比
 
@@ -177,13 +184,34 @@ curl -s -X POST http://127.0.0.1:8000/api/risk/scenarios/evaluate \
   最短可还原表示、拒绝 NaN/Infinity）。
 - 每条目携带：输入概况（组合/情景/持仓数/行情天数）、规则版本戳、
   判定理由（`rationale`，说明结论如何得出或为何被拒）。
-- 排名（`rankings`）：
-  - `worst_by_portfolio` — 每个组合在其所有情景下的最差（最小）
-    PnL，按该值升序排（亏得最多的在前）；
-  - `worst_by_scenario` — 每个情景在所有组合下的最差 PnL，同理；
-  - 口径在载荷中明示：`metric: pnl`、`order: ascending`；并列时按
-    **名称字典序、再按首次提交下标**（`tie_break` 字段说明），因此
-    同一批输入每次排名完全相同。失败条目不参与排名。
+
+### 可读文本导出（本地打开即读）
+
+- `POST /api/risk/scan/snapshot/text`（`text/plain`）或
+  `RiskService.scan_snapshot_text` / `risk_engine.snapshot.render_text`：
+  把同一份快照渲染成**纯文本报告**，保存到本地后直接用编辑器打开
+  即可阅读，无需再解析 JSON。
+- 报告内容：
+  - 头部：格式版本、条目总数、通过/被拒计数、按失败类别的小计
+    （`failures by category: invalid_input=2, timeout=1`）；
+  - 每条目一块：序号与类型、`OK`/`REJECTED` 状态、输入概况、规则
+    版本、判定理由；通过条目附完整结果，被拒条目附
+    `code=... category=... reason=...`；
+  - 末尾：两个最差情形排名（口径与并列规则写在排名头部）。
+- 文本导出**不含时间戳等运行期数据**：同一批输入重复导出、换并发
+  度导出，文本逐位一致，可直接归档或发给他人 diff 比对。
+- 时限截断时：已完成的条目在快照与文本中**原样保留**（与充裕时限
+  下的结果逐位相同），只有真正未完成的条目被标为
+  `EVALUATION_TIMEOUT`。
+
+### 排名（`rankings`）
+
+- `worst_by_portfolio` — 每个组合在其所有情景下的最差（最小）
+  PnL，按该值升序排（亏得最多的在前）；
+- `worst_by_scenario` — 每个情景在所有组合下的最差 PnL，同理；
+- 口径在载荷中明示：`metric: pnl`、`order: ascending`；并列时按
+  **名称字典序、再按首次提交下标**（`tie_break` 字段说明），因此
+  同一批输入每次排名完全相同。失败条目不参与排名。
 
 ## 批量上限与时限配置
 
@@ -201,11 +229,24 @@ HTTP 请求体示例（`/scan`、`/reassess`、`/batch` 同构）：
 {"jobs": [...], "max_items": 256, "timeout_seconds": 10.0}
 ```
 
+## 失败类别（category）
+
+每个错误对象除了具体 `code`，还带一个粗粒度 `category` 字段，四类
+失败一眼可分（批量结果、快照条目、文本导出中都带这个字段）：
+
+| category | 含义 | 典型 code |
+|---|---|---|
+| `invalid_input` | 输入本身非法/不一致 | `INVALID_INPUT`、`INVALID_WINDOW`、`INVALID_PARAMETER`、`UNKNOWN_*`、矩阵校验族、`INCOMPATIBLE_VERSION` |
+| `resource_limit` | 数量/资源超限 | `BATCH_SIZE_LIMIT`、`RESOURCE_LIMIT_EXCEEDED` |
+| `timeout` | 超出时间预算 | `EVALUATION_TIMEOUT` |
+| `internal` | 引擎内部失败（已包装） | `COMPUTATION_ERROR` |
+
 ## 错误码一览
 
 | code | 含义 | HTTP |
 |---|---|---|
 | `INSUFFICIENT_DATA` | 历史不足/窗口超过样本/非正价格/序列不齐 | 422 |
+| `INVALID_INPUT` | 原始输入无法解析（如日期写法不合法） | 422 |
 | `INVALID_WINDOW` | window<1、horizon<1 | 422 |
 | `INVALID_PARAMETER` | 置信度越界、冲突入参 | 422 |
 | `UNKNOWN_INSTRUMENT` | 标的无行情或未持有 | 422 |
@@ -225,7 +266,8 @@ HTTP 请求体示例（`/scan`、`/reassess`、`/batch` 同构）：
 ## 本地验证方法
 
 ```bash
-# 全量测试（含非法相关性、极端情景、并发批量、扫描、跨版本对比、快照）
+# 全量测试（含非法相关性、极端情景、并发批量、扫描、跨版本对比、
+# 快照与文本导出、坏输入隔离、失败类别区分）
 # 默认即打印每个用例的输入摘要与判定依据，无需额外参数
 uv run pytest tests/ -q
 
@@ -235,6 +277,8 @@ uv run pytest tests/test_batch.py -q
 uv run pytest tests/test_scan.py -q
 uv run pytest tests/test_reassess.py -q
 uv run pytest tests/test_snapshot.py -q
+uv run pytest tests/test_snapshot_export.py -q   # 文本导出/截断保留/失败类别
+uv run pytest tests/test_api.py -q               # HTTP 集成（含坏日期隔离）
 ```
 
 测试日志约定：每个用例通过 `log.info("case=...; criterion: ...")`
@@ -244,9 +288,17 @@ uv run pytest tests/test_snapshot.py -q
 
 ## 与既有能力的兼容范围
 
-- 新增的 `/scan`、`/scan/snapshot`、`/reassess` 端点与
-  `RiskService.scan / scan_snapshot / batch_reassess` 均为**纯增量**，
-  不改变 `/assess`、`/batch`、情景与相关性端点的既有行为。
+- 新增的 `/scan`、`/scan/snapshot`、`/scan/snapshot/text`、`/reassess`
+  端点与 `RiskService.scan / scan_snapshot / scan_snapshot_text /
+  batch_reassess` 均为**纯增量**，不改变 `/assess`、`/batch`、情景与
+  相关性端点的既有行为。
+- 错误对象新增 `category` 字段（纯增量）；新增 `INVALID_INPUT` 码
+  表示原始输入无法解析（此前这类解析错误会把整批请求带崩为 500）。
+- 请求 schema 不再在边界上拦截数值范围（window/置信度/期限）：越界
+  值改由引擎逐条校验并返回带类型的 422（如 `INVALID_WINDOW`），
+  使批量中单个越界条目只影响自己的槽位；单条 `/assess` 的越界
+  请求仍是 422，只是错误体从框架默认格式变为统一的
+  `{"error": {code, category, reason}}`。
 - 快照格式独立版本化（`risk-engine-snapshot/1`），与规则版本
   （`v1`/`v2`/...）正交：规则版本戳在每条目内，快照格式版本在
   文档头部。

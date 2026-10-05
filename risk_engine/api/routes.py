@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from risk_engine.errors import (
     ComputationError,
@@ -66,6 +66,49 @@ def _resolve_correlation(svc, payload):
     if payload.correlation_name:
         return svc.get_correlation(payload.correlation_name)
     return None
+
+
+def _resolve_each(payload_requests, make_job):
+    """Resolve each request independently.
+
+    A bad item (malformed date, unknown reference, ...) fails only its
+    own ordered slot; it never aborts the batch.  Returns
+    ``(jobs, pre_failures)`` where ``jobs`` has ``None`` in failed slots.
+    """
+    jobs = []
+    pre_failures: dict[int, dict] = {}
+    for i, req in enumerate(payload_requests):
+        try:
+            jobs.append(make_job(req))
+        except RiskEngineError as err:
+            jobs.append(None)
+            pre_failures[i] = err.to_dict()
+        except Exception as exc:  # malformed raw input, never abort batch
+            jobs.append(None)
+            pre_failures[i] = RiskEngineError(
+                f"malformed request item: {exc}", code="INVALID_INPUT"
+            ).to_dict()
+    return jobs, pre_failures
+
+
+def _merge_results(total: int, jobs: list, pre_failures: dict[int, dict],
+                   results) -> list[dict]:
+    """Re-insert pre-resolution failures at their original indices."""
+    merged: list = []
+    k = 0
+    for i in range(total):
+        if i in pre_failures:
+            merged.append(
+                {"index": i, "ok": False, "result": None,
+                 "error": pre_failures[i]}
+            )
+        else:
+            r = results[k]
+            k += 1
+            merged.append(
+                {"index": i, "ok": r.ok, "result": r.result, "error": r.error}
+            )
+    return merged
 
 
 def _summary(payload) -> dict:
@@ -129,37 +172,76 @@ def batch(payload: BatchAssessRequest, request: Request):
 
     # Resolve each request independently so one bad reference does not
     # abort the batch; resolution failures occupy their own ordered slot.
-    jobs = []
-    pre_failures: dict[int, dict] = {}
-    for i, req in enumerate(payload.requests):
-        try:
-            jobs.append(to_job(req, _resolve_correlation(svc, req)))
-        except RiskEngineError as err:
-            jobs.append(None)
-            pre_failures[i] = err.to_dict()
+    jobs, pre_failures = _resolve_each(
+        payload.requests, lambda req: to_job(req, _resolve_correlation(svc, req))
+    )
     try:
         results = svc.batch_assess([j for j in jobs if j is not None], limits)
     except RiskEngineError as err:
         return _error_response(err, _http_status(err))
 
-    # Re-insert pre-resolution failures at their original indices.
-    merged: list = []
-    k = 0
-    for i in range(len(payload.requests)):
-        if i in pre_failures:
-            merged.append(
-                {"index": i, "ok": False, "result": None, "error": pre_failures[i]}
-            )
-        else:
-            r = results[k]
-            k += 1
-            merged.append(
-                {"index": i, "ok": r.ok, "result": r.result, "error": r.error}
-            )
+    merged = _merge_results(len(payload.requests), jobs, pre_failures, results)
     return {
         "count": len(merged),
         "results": merged,
     }
+
+
+def _resolve_scan_jobs(payload_jobs):
+    """Resolve scan jobs one by one.
+
+    A job whose portfolio/market data is malformed fails only its own
+    scenario pairs: they become ``failed_slots`` (final pair index ->
+    ``(error, summary)``) while every other job is evaluated normally.
+    """
+    from risk_engine.scan import ScanJob
+
+    jobs = []
+    failed_slots: dict[int, tuple[dict, dict]] = {}
+    pair_index = 0
+    for j in payload_jobs:
+        try:
+            jobs.append(
+                ScanJob(
+                    portfolio=to_portfolio(j.portfolio),
+                    market=to_market(j.market),
+                    scenario_names=tuple(j.scenario_names),
+                )
+            )
+            pair_index += len(j.scenario_names)
+        except RiskEngineError as err:
+            base = {
+                "portfolio": j.portfolio.name,
+                "holdings": len(j.portfolio.holdings),
+                "dates": len(j.market.dates),
+            }
+            for name in j.scenario_names:
+                failed_slots[pair_index] = (
+                    err.to_dict(), {**base, "scenario": name}
+                )
+                pair_index += 1
+        except Exception as exc:  # malformed raw input, never abort scan
+            err = RiskEngineError(
+                f"malformed scan job: {exc}", code="INVALID_INPUT"
+            ).to_dict()
+            base = {
+                "portfolio": j.portfolio.name,
+                "holdings": len(j.portfolio.holdings),
+                "dates": len(j.market.dates),
+            }
+            for name in j.scenario_names:
+                failed_slots[pair_index] = (err, {**base, "scenario": name})
+                pair_index += 1
+    return jobs, failed_slots
+
+
+def _limits(payload) -> "BatchLimits":
+    from risk_engine.batch import BatchLimits
+
+    return BatchLimits(
+        max_items=payload.max_items or BatchLimits().max_items,
+        timeout_seconds=payload.timeout_seconds or BatchLimits().timeout_seconds,
+    )
 
 
 @router.post("/scan")
@@ -173,32 +255,27 @@ def scan(payload: ScanRequest, request: Request):
         payload.timeout_seconds,
     )
     svc = _service(request)
-    from risk_engine.batch import BatchLimits
-    from risk_engine.scan import ScanJob
-
-    limits = BatchLimits(
-        max_items=payload.max_items or BatchLimits().max_items,
-        timeout_seconds=payload.timeout_seconds or BatchLimits().timeout_seconds,
-    )
-    jobs = [
-        ScanJob(
-            portfolio=to_portfolio(j.portfolio),
-            market=to_market(j.market),
-            scenario_names=tuple(j.scenario_names),
-        )
-        for j in payload.jobs
-    ]
+    jobs, failed_slots = _resolve_scan_jobs(payload.jobs)
     try:
-        results = svc.scan(jobs, limits)
+        results = svc.scan(jobs, _limits(payload))
     except RiskEngineError as err:
         return _error_response(err, _http_status(err))
-    return {
-        "count": len(results),
-        "results": [
-            {"index": r.index, "ok": r.ok, "result": r.result, "error": r.error}
-            for r in results
-        ],
-    }
+    merged: list = []
+    k = 0
+    total = len(results) + len(failed_slots)
+    for i in range(total):
+        if i in failed_slots:
+            error, _summary_dict = failed_slots[i]
+            merged.append(
+                {"index": i, "ok": False, "result": None, "error": error}
+            )
+        else:
+            r = results[k]
+            k += 1
+            merged.append(
+                {"index": i, "ok": r.ok, "result": r.result, "error": r.error}
+            )
+    return {"count": len(merged), "results": merged}
 
 
 @router.post("/scan/snapshot")
@@ -206,25 +283,31 @@ def scan_snapshot(payload: ScanRequest, request: Request):
     """Run a scan and return a deterministic, ranked result snapshot."""
     logger.info("scan snapshot request jobs=%d", len(payload.jobs))
     svc = _service(request)
-    from risk_engine.batch import BatchLimits
-    from risk_engine.scan import ScanJob
-
-    limits = BatchLimits(
-        max_items=payload.max_items or BatchLimits().max_items,
-        timeout_seconds=payload.timeout_seconds or BatchLimits().timeout_seconds,
-    )
-    jobs = [
-        ScanJob(
-            portfolio=to_portfolio(j.portfolio),
-            market=to_market(j.market),
-            scenario_names=tuple(j.scenario_names),
-        )
-        for j in payload.jobs
-    ]
+    jobs, failed_slots = _resolve_scan_jobs(payload.jobs)
     try:
-        return svc.scan_snapshot(jobs, limits)
+        return svc.scan_snapshot(jobs, _limits(payload), failed_slots=failed_slots)
     except RiskEngineError as err:
         return _error_response(err, _http_status(err))
+
+
+@router.post("/scan/snapshot/text")
+def scan_snapshot_text(payload: ScanRequest, request: Request):
+    """Run a scan and return a human-readable, byte-stable text report.
+
+    The response is ``text/plain``: save it to a file and open it
+    directly — no further parsing needed.  Repeated exports of the same
+    inputs are byte-identical.
+    """
+    logger.info("scan snapshot text request jobs=%d", len(payload.jobs))
+    svc = _service(request)
+    jobs, failed_slots = _resolve_scan_jobs(payload.jobs)
+    try:
+        text = svc.scan_snapshot_text(
+            jobs, _limits(payload), failed_slots=failed_slots
+        )
+    except RiskEngineError as err:
+        return _error_response(err, _http_status(err))
+    return PlainTextResponse(text)
 
 
 @router.post("/reassess")
@@ -244,46 +327,27 @@ def reassess(payload: ReassessRequest, request: Request):
         timeout_seconds=payload.timeout_seconds or BatchLimits().timeout_seconds,
     )
     # Resolve each job independently; a bad reference fails only its slot.
-    jobs = []
-    pre_failures: dict[int, dict] = {}
-    for i, j in enumerate(payload.jobs):
-        try:
-            correlation = _resolve_correlation(svc, j)
-            jobs.append(
-                ReassessJob(
-                    portfolio=to_portfolio(j.portfolio),
-                    market=to_market(j.market),
-                    stamped_version=j.stamped_version,
-                    target_version=j.target_version,
-                    original=j.original,
-                    window=j.window,
-                    confidence=j.confidence,
-                    horizon_days=j.horizon_days,
-                    correlation=correlation,
-                    allow_breaking=j.allow_breaking,
-                )
-            )
-        except RiskEngineError as err:
-            jobs.append(None)
-            pre_failures[i] = err.to_dict()
+    def _make_job(j):
+        return ReassessJob(
+            portfolio=to_portfolio(j.portfolio),
+            market=to_market(j.market),
+            stamped_version=j.stamped_version,
+            target_version=j.target_version,
+            original=j.original,
+            window=j.window,
+            confidence=j.confidence,
+            horizon_days=j.horizon_days,
+            correlation=_resolve_correlation(svc, j),
+            allow_breaking=j.allow_breaking,
+        )
+
+    jobs, pre_failures = _resolve_each(payload.jobs, _make_job)
     try:
         results = svc.batch_reassess([j for j in jobs if j is not None], limits)
     except RiskEngineError as err:
         return _error_response(err, _http_status(err))
 
-    merged: list = []
-    k = 0
-    for i in range(len(payload.jobs)):
-        if i in pre_failures:
-            merged.append(
-                {"index": i, "ok": False, "result": None, "error": pre_failures[i]}
-            )
-        else:
-            r = results[k]
-            k += 1
-            merged.append(
-                {"index": i, "ok": r.ok, "result": r.result, "error": r.error}
-            )
+    merged = _merge_results(len(payload.jobs), jobs, pre_failures, results)
     return {"count": len(merged), "results": merged}
 
 

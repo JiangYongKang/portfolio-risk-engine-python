@@ -1,8 +1,15 @@
-"""Pydantic request/response schemas for the HTTP layer."""
+"""Pydantic request/response schemas for the HTTP layer.
+
+Numeric ranges (window, confidence, horizon) are intentionally *not*
+constrained here: the engine validates them per item and raises typed
+errors, so that in a batch one out-of-range item fails only its own
+slot instead of rejecting the whole request at the schema boundary.
+Only structural shape (types, required fields) is enforced here.
+"""
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 
 class HoldingSchema(BaseModel):
@@ -30,9 +37,9 @@ class CorrelationSchema(BaseModel):
 class AssessRequest(BaseModel):
     portfolio: PortfolioSchema
     market: MarketDataSchema
-    window: int = Field(default=20, ge=1)
-    confidence: float = Field(default=0.99, gt=0.5, lt=1.0)
-    horizon_days: int = Field(default=1, ge=1)
+    window: int = 20
+    confidence: float = 0.99
+    horizon_days: int = 1
     correlation: CorrelationSchema | None = None
     correlation_name: str | None = None
     version: str = "v1"
@@ -62,9 +69,9 @@ class ReassessJobSchema(BaseModel):
     stamped_version: str
     target_version: str
     original: dict
-    window: int = Field(default=20, ge=1)
-    confidence: float = Field(default=0.99, gt=0.5, lt=1.0)
-    horizon_days: int = Field(default=1, ge=1)
+    window: int = 20
+    confidence: float = 0.99
+    horizon_days: int = 1
     correlation: CorrelationSchema | None = None
     correlation_name: str | None = None
     allow_breaking: bool = False
